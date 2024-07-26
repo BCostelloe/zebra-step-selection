@@ -46,9 +46,114 @@ def extract_observed_steps(step_length, raw_tracks_directory, save_directory, ob
             ids = [str(obs + '_' + str(t) + '_f' + str(p) + '_ob') for p in frames]
             new_df = pd.DataFrame(zip(frames, lats, lons, ids), columns = ['frame', 'lat', 'lon', 'id'])
             new_df.to_pickle(new_file)
-                                           
+
+def calculate_full_angles(points): # from ChatGPT
+    """
+    Calculates the turning angles between vectors defined by a series of location coordinates.
+    """
+    angles = []
+    vectors = []
+
+    # Compute vectors between consecutive points
+    for i in range(len(points) - 1):
+        vector = np.array([points[i+1][0] - points[i][0], points[i+1][1] - points[i][1]])
+        vectors.append(vector)
+
+    # Compute angles between consecutive vectors
+    for i in range(len(vectors) - 1):
+        vector1 = vectors[i]
+        vector2 = vectors[i+1]
+
+        # Calculate dot product and magnitudes
+        dot_product = np.dot(vector1, vector2)
+        mag1 = np.linalg.norm(vector1)
+        mag2 = np.linalg.norm(vector2)
+
+        # Calculate the angle in radians
+        if mag1 * mag2 == 0:  # prevent division by zero if any vector is a zero vector
+            angle = 0
+        else:
+            cos_angle = dot_product / (mag1 * mag2)
+            # Ensure the cosine value is within the valid range to avoid numerical issues
+            cos_angle = max(min(cos_angle, 1), -1)
+            angle = np.arccos(cos_angle)
+
+        # Determine the direction of the angle (clockwise or counterclockwise)
+        cross_product = np.cross(vector1, vector2)
+        if cross_product > 0:
+            # Counterclockwise rotation
+            angle = angle
+        else:
+            # Clockwise rotation
+            #angle = 2 * np.pi - angle
+            angle = -angle
+
+        angle = np.degrees(angle)  # Convert to degrees
+        angles.append(angle)
+
+    return angles
+
+# This is adapted from ChatGPT.
+
+def calculate_multiple_simulated_points(points, data_frame, raster_band, num_simulated_points, originX, originY, cellSizeX, cellSizeY):
+    """
+    Calculate multiple new points from given points, with specified numbers of simulated points.
+    Random distances and angles are drawn from the provided DataFrame.
+
+    To implement: Points are checked to ensure they are within the bounds of a DSM raster. 
+    Points outside the bounds are discarded and new ones drawn.
+    
+    :param points: List of tuples (x, y) representing coordinates.
+    :param data_frame: DataFrame with columns 'angle' and 'distance' to draw random samples.
+    :param num_simulated_points: Number of simulated points to generate per real point.
+    :param raster_band: band from DSM raster
+    
+    :return: Dictionary with each real point as a key, and list of tuples (x, y) of simulated points.
+    """
+    simulated_points = {}
+
+    for i in range(1, len(points)):
+        simulated_points_for_point = []
+        # Calculate the vector from the previous point to the current point
+        dx = points[i][0] - points[i-1][0]
+        dy = points[i][1] - points[i-1][1]
+        
+        # Calculate the angle of this vector from the horizontal
+        vector_angle = np.degrees(np.arctan2(dy, dx))
+        
+        counter = num_simulated_points
+        
+        while counter > 0:
+            # Draw random distance and angle
+            sample = data_frame.sample(1).iloc[0]
+            distance = sample['distance']
+            angle = sample['angle']
+            
+            # Calculate the absolute angle for the new simulated point
+            current_angle = vector_angle + angle
+            radian_angle = np.radians(current_angle)
+            
+            # Calculate the new simulated point's coordinates
+            new_y = points[i-1][0] + distance * np.cos(radian_angle)
+            new_x = points[i-1][1] + distance * np.sin(radian_angle)
+
+            ## Check that the simulated point has a valid value in the DSM
+            col = int((new_x - originX)/cellSizeX)
+            row = int((new_y - originY)/cellSizeY)
+            DSM_val = raster_band[row,col]
+            if DSM_val == -10000:
+                continue
+            else:
+                simulated_points_for_point.append((new_x, new_y))
+                counter = counter - 1
+        
+        simulated_points[points[i]] = simulated_points_for_point
+    
+    return simulated_points
 
 
+
+### I don't think the things below this line are used in the pipeline:
 def calculate_initial_compass_bearing(pointA, pointB): # adjusted from source: https://gist.github.com/jeromer/2005586
     """
     Calculates the bearing between two points.
