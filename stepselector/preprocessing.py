@@ -8,6 +8,7 @@ import rasterio as rio
 import pickle
 from tqdm.notebook import tqdm
 import utm
+from osgeo import gdal
 
 def extract_observed_steps(step_length, raw_tracks_directory, save_directory, obs_to_process = None):
     """
@@ -251,6 +252,7 @@ def simulate_fake_steps(n_steps, observed_steps_directory, save_directory, map_d
                 new_filename = f.split('/')[-1].split('.')[0] + '_sim.pkl'
                 new_file = os.path.join('../data/five_meter_steps/simulated', new_filename)
                 new_df.to_pickle(new_file)
+        DSM.close()
 
 # source: https://stackoverflow.com/questions/28260962/calculating-angles-between-line-segments-python-with-math-atan2
 def dot(vA, vB):
@@ -453,6 +455,7 @@ def calculate_zebra_heights(observed_steps_directory, simulated_steps_directory,
             steps['observer_height'] = [obheights[row,col] for row,col in zip(rows, cols)]
 
             steps.to_pickle(f)
+        obheights_raster.close()
 
 def road_or_no(observed_steps_directory, simulated_steps_directory, rasters_directory, ob_metadata_file, obs_to_process = None):
     """
@@ -506,6 +509,7 @@ def road_or_no(observed_steps_directory, simulated_steps_directory, rasters_dire
             steps['road'] = steps['road'].astype('int32')
 
             steps.to_pickle(f)
+        roads_raster.close()
 
 def step_slope(observed_steps_directory, simulated_steps_directory, map_directory, ob_metadata_file, obs_to_process = None):
     """
@@ -532,7 +536,7 @@ def step_slope(observed_steps_directory, simulated_steps_directory, map_director
     else:
         observations = obs_to_process
 
-
+        
     for o in tqdm(observations):
         # get map name and info
         full_ob_name = 'observation' + o.split('b')[-1]
@@ -612,7 +616,152 @@ def step_slope(observed_steps_directory, simulated_steps_directory, map_director
                         else:
                             continue
             steps.to_pickle(f)
+        dtm.close()
 
+def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tracks_directory, rasters_directory, map_directory, ob_metadata_file, track_metadata_file, obs_to_process = None):
+    """
+    Get information on the focal animal's relationship (distance, visibility) to other group mates at each step location
+
+    Parameters:
+        - observed_steps_directory: folder where the observed steps .pkl files are stored. Should be one .pkl per track.
+        - simulated_steps_directory: folder where the simulated steps .pkl files are stored. Should be one .pkl per track.
+        - raw_tracks_directory: folder where the raw trajectories are stored. Should be one .npy per observation.
+        - rasters_directory: folder where generated raster files (zebra height rasters) are saved
+        - map_directory: folder where the mapping ouputs are saved
+        - ob_metadata_file: file giving the map area names that correspond to each observation
+        - obs_to_process (OPTIONAL): if you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
+    """
+    # Load metadata file
+    metadata = pd.read_csv(ob_metadata_file)
+    track_metadata = pd.read_csv(track_metadata_file)
+    
+    # Define observations to be processed
+    if obs_to_process is None:
+        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '*.pkl')))
+        observations = []
+        for f in observed_step_files:
+            obs = f.split('/')[-1].split('_')[0]
+            observations = np.append(observations, obs)
+            observations = np.unique(observations)
+    else:
+        observations = obs_to_process
+
+    for o in tqdm(observations):
+        # get raw tracks file
+        raw_tracks_file = os.path.join(raw_tracks_directory, str(o + '_utm_tracks.npy'))
+        raw_tracks = np.load(raw_tracks_file, allow_pickle = True)
+        
+        # get map name
+        full_ob_name = 'observation' + o.split('b')[-1]
+        map_name = metadata[metadata['observation'] == full_ob_name]['big_map'].item()
+
+        # get zebra heights raster & info
+        obheights_raster = os.path.join(rasters_directory,'%s_ZebraHeights_1-5m.tif' %map_name)
+        obheights_raster = rio.open(obheights_raster)
+        obheights = obheights_raster.read(1)
+        originX = obheights_raster.bounds[0]
+        originY = obheights_raster.bounds[3]
+        cellSizeX = obheights_raster.transform[0]
+        cellSizeY = obheights_raster.transform[4]
+
+        # get DSM raster and info
+        dsm_raster = os.path.join(map_directory, map_name, '3_dsm_ortho', '1_dsm', '%s_dsm.tif' %map_name)
+        dsm = rio.open(dsm_raster)
+        dsm_rio = dsm.read(1)
+        dsmX = dsm.bounds[0]
+        dsmY = dsm.bounds[3]
+        dsmcellSizeX = dsm.transform[0]
+        dsmcellSizeY = dsm.transform[4]
+        dsm.close()
+
+        dataset = gdal.Open(dsm_raster)
+        dsm = dataset.GetRasterBand(1)
+
+        # get step files
+        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '%s*.pkl' %o)))
+        simulated_step_files = sorted(glob.glob(os.path.join(simulated_steps_directory, '%s*.pkl' %o)))
+        step_files = observed_step_files + simulated_step_files
+
+        for f in step_files:
+            steps = pd.read_pickle(f)
+            track = int(f.split('/')[-1].split('_')[1].split('k')[1])
+            frames = list(steps.frame)
+            points = list(zip(steps.lon, steps.lat))
+            social_dat = []
+            for n, p in enumerate(frames):
+                focal_point = points[n]
+                step_id = steps.loc[n,'id']
+                neighbor_ids = []
+                neighbor_spps = []
+                neighbor_points = []
+                neighbor_distances = []
+                neighbor_visibilities = []
+                focal_height = steps.loc[n, 'observer_height']
+
+                # calculate focal animal's altitude in DSM units
+                dsm_col_focal = int((focal_point[0] - dsmX)/dsmcellSizeX)
+                dsm_row_focal = int((focal_point[1] - dsmY)/dsmcellSizeY)
+                focal_altitude = focal_height + float(dsm_rio[dsm_row_focal, dsm_col_focal])
+
+                # Get info on neighbors from raw tracks
+                for t in np.arange(len(raw_tracks)):
+                    if t == track:
+                        continue
+                    else:
+                        neighbor_id = track_metadata[(track_metadata['observation']==full_ob_name) & (track_metadata['track'] == t)]['individual_ID'].item() #look this up from track metadata based on track number
+                        neighbor_spp = track_metadata[(track_metadata['observation']==full_ob_name) & (track_metadata['track'] == t)]['species'].item()
+                        neighbor_point = raw_tracks[t][p]
+        
+                        if not np.isnan(neighbor_point).any():  
+                            neighbor_dist = math.dist([neighbor_point[0], neighbor_point[1]], [focal_point[0], focal_point[1]])
+                            # get neighbor height by sampling zebra heights raster
+                            col = int((neighbor_point[0] - originX)/cellSizeX)
+                            row = int((neighbor_point[1] - originY)/cellSizeY)
+                            neighbor_height = float(obheights[row,col])
+        
+                            dsm_col_neighbor = int((neighbor_point[0] - dsmX)/dsmcellSizeX)
+                            dsm_row_neighbor = int((neighbor_point[1] - dsmY)/dsmcellSizeY)
+                            neighbor_altitude = neighbor_height + float(dsm_rio[dsm_row_neighbor, dsm_col_neighbor])
+                            neighbor_vis = gdal.IsLineOfSightVisible(band = dsm,
+                                                                    xA = dsm_col_focal,
+                                                                    yA = dsm_row_focal,
+                                                                    zA = focal_altitude,
+                                                                    xB = dsm_col_neighbor,
+                                                                    yB = dsm_row_neighbor,
+                                                                    zB = neighbor_altitude)
+                            is_visible = neighbor_vis.is_visible
+                            neighbor_ids.append(neighbor_id)
+                            neighbor_spps.append(neighbor_spp)
+                            neighbor_points.append(neighbor_point)
+                            neighbor_distances.append(neighbor_dist)
+                            neighbor_visibilities.append(is_visible)
+                        else:
+                            neighbor_ids.append(neighbor_id)
+                            neighbor_spps.append(neighbor_spp)
+                            neighbor_points.append(neighbor_point)
+                            neighbor_distances.append(np.nan)
+                            neighbor_visibilities.append(np.nan)
+            
+                # Create dictionary with keys for step ID, neighbor IDs, neighbor distances, neighbor visibilities 
+                social_dict = {'step_id': step_id, 
+                               'neighbor_ids': neighbor_ids, 
+                               'neighbor_spps': neighbor_spps,
+                               'neighbor_points': neighbor_points, 
+                               'neighbor_distances': neighbor_distances,
+                               'neighbor_visibility': neighbor_visibilities
+                              }
+                    # Store dictionary in social_dat list
+                social_dat.append(social_dict)
+                # Define filename for list of dictionaries - one list per track, one dictionary per step location
+            steps['neighbor_ids'] = [x['neighbor_ids'] if x['step_id'] == y else np.nan for x, y in zip(social_dat, steps['id'])]
+            steps['neighbor_spps'] = [x['neighbor_spps'] if x['step_id'] == y else np.nan for x, y in zip(social_dat, steps['id'])]
+            steps['neighbor_points'] = [x['neighbor_points'] if x['step_id'] == y else np.nan for x, y in zip(social_dat, steps['id'])]
+            steps['neighbor_distances'] = [x['neighbor_distances'] if x['step_id'] == y else np.nan for x, y in zip(social_dat, steps['id'])]
+            steps['neighbor_visibility'] = [x['neighbor_visibility'] if x['step_id'] == y else np.nan for x, y in zip(social_dat, steps['id'])]
+            
+            steps.to_pickle(f)
+        obheights_raster.close()
+        dataset = None
 
 ### I don't think the things below this line are used in the pipeline:
 def calculate_initial_compass_bearing(pointA, pointB): # adjusted from source: https://gist.github.com/jeromer/2005586
