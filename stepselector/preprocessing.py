@@ -49,7 +49,7 @@ def extract_observed_steps(step_length, raw_tracks_directory, save_directory, ob
             lons = [i[0] for i in steps]
             lats = [i[1] for i in steps]
             ids = [str(obs + '_' + str(t) + '_f' + str(p) + '_ob') for p in frames]
-            new_df = pd.DataFrame(zip(frames, lats, lons, ids), columns = ['frame', 'lat', 'lon', 'id'])
+            new_df = pd.DataFrame(zip(frames, lats, lons, ids, ids), columns = ['frame', 'lat', 'lon', 'target_id', 'id'])
             new_df.to_pickle(new_file)
 
 def calculate_full_angles(points): # from ChatGPT
@@ -156,7 +156,7 @@ def calculate_multiple_simulated_points(points, data_frame, raster_band, num_sim
     
     return simulated_points
 
-def simulate_fake_steps(n_steps, observed_steps_directory, save_directory, map_directory, ob_metadata_file, obs_to_process = None):
+def simulate_fake_steps(n_steps, observed_steps_directory, save_directory, rasters_directory, ob_metadata_file, obs_to_process = None):
     """
     Generate some number of simulated alternative steps for each observed step.
     Simulated steps are defined by drawing randomly from the observed distributions of step lengths and turning angles.
@@ -166,7 +166,7 @@ def simulate_fake_steps(n_steps, observed_steps_directory, save_directory, map_d
         - n_steps: the number of simulated steps that should be generated for each observed step
         - observed_steps_directory: folder where the observed steps .pkl files are stored. Should be one .pkl per track.
         - save_directory: where to save the resulting dataframes.
-        - map_directory: folder where maps are saved
+        - rasters_directory: folder where raster files are stored
         - ob_metadata_file: file giving the map area names that correspond to each observation
         - obs_to_process (OPTIONAL): if you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
     """
@@ -190,8 +190,7 @@ def simulate_fake_steps(n_steps, observed_steps_directory, save_directory, map_d
         # get map name and info
         full_ob_name = 'observation' + o.split('b')[-1]
         map_name = metadata[metadata['observation'] == full_ob_name]['big_map'].item()
-        map_folder = os.path.join(map_directory, map_name)
-        dsm_file = os.path.join(map_folder, '3_dsm_ortho', '1_dsm', map_name + '_dsm.tif')
+        dsm_file = os.path.join(rasters_directory, 'DSMs', map_name + '_dsm.tif')
         DSM = rio.open(dsm_file)
         dsm = DSM.read(1)
         originX = DSM.bounds[0]
@@ -244,13 +243,13 @@ def simulate_fake_steps(n_steps, observed_steps_directory, save_directory, map_d
                 new_df['step_type'] = 'simulated'
                 new_df['count'] = new_df.groupby('frame').cumcount()
                 new_df['id'] = [str(o + '_' + track + '_f' + str(frame) + '_sim-' + str(count)) for frame, count in zip(new_df['frame'],new_df['count'])]
-                new_df['observed_step_id'] = [str(o + '_' + track + '_f' + str(frame) + '_ob') for frame in new_df['frame']]
+                new_df['target_id'] = [str(o + '_' + track + '_f' + str(frame) + '_ob') for frame in new_df['frame']]
                 new_df.drop(['count'], inplace=True, axis=1)
                 #full_df = pd.concat([step_file, new_df], ignore_index = True)
                 
                 # create new filename
                 new_filename = f.split('/')[-1].split('.')[0] + '_sim.pkl'
-                new_file = os.path.join('../data/five_meter_steps/simulated', new_filename)
+                new_file = os.path.join(save_directory, new_filename)
                 new_df.to_pickle(new_file)
         DSM.close()
 
@@ -289,10 +288,8 @@ def get_observer_and_step_info(observed_steps_directory, simulated_steps_directo
     Each step is checked to ensure that it falls within the bounds of the associated DSM raster.
 
     Parameters:
-        - n_steps: the number of simulated steps that should be generated for each observed step
         - observed_steps_directory: folder where the observed steps .pkl files are stored. Should be one .pkl per track.
-        - save_directory: where to save the resulting dataframes.
-        - map_directory: folder where maps are saved
+        - simulated_steps_directory: folder where the simulated steps .pkl files are stored. Should be one .pkl per track.
         - ob_metadata_file: file giving the map area names that correspond to each observation
         - obs_to_process (OPTIONAL): if you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
     """
@@ -399,7 +396,7 @@ def get_observer_and_step_info(observed_steps_directory, simulated_steps_directo
                             data.loc[index, 'step_duration_s'] = step_duration_s
                             data.loc[index, 'step_speed_mps'] = step_speed_mps
 
-            data = data[['frame', 'lat', 'lon', 'id', 'angle_to_observers', 'dist_to_observer', 'delta_observer_dist', 'prev_step', 
+            data = data[['frame', 'lat', 'lon', 'id', 'target_id', 'angle_to_observers', 'dist_to_observer', 'delta_observer_dist', 'prev_step', 
                         'step_length_m', 'step_duration_s', 'step_speed_mps']]
             data.to_pickle(f)
 
@@ -412,7 +409,7 @@ def calculate_zebra_heights(observed_steps_directory, simulated_steps_directory,
     Parameters:
         - observed_steps_directory: folder where the observed steps .pkl files are stored. Should be one .pkl per track.
         - simulated_steps_directory: folder where the simulated steps .pkl files are stored. Should be one .pkl per track.
-        - rasters_directory: folder where generated raster files (zebra height rasters) are saved
+        - rasters_directory: folder where raster files are stored
         - ob_metadata_file: file giving the map area names that correspond to each observation
         - obs_to_process (OPTIONAL): if you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
     """
@@ -435,7 +432,7 @@ def calculate_zebra_heights(observed_steps_directory, simulated_steps_directory,
         # get map name and info
         full_ob_name = 'observation' + o.split('b')[-1]
         map_name = metadata[metadata['observation'] == full_ob_name]['big_map'].item()
-        obheights_raster = os.path.join(rasters_directory,'%s_ZebraHeights_1-5m.tif' %map_name)
+        obheights_raster = os.path.join(rasters_directory, 'zebra_heights', '%s_ZebraHeights_1-5m.tif' %map_name)
         obheights_raster = rio.open(obheights_raster)
         obheights = obheights_raster.read(1)
         originX = obheights_raster.bounds[0]
@@ -464,7 +461,7 @@ def road_or_no(observed_steps_directory, simulated_steps_directory, rasters_dire
     Parameters:
         - observed_steps_directory: folder where the observed steps .pkl files are stored. Should be one .pkl per track.
         - simulated_steps_directory: folder where the simulated steps .pkl files are stored. Should be one .pkl per track.
-        - rasters_directory: folder where generated raster files (road rasters) are saved
+        - rasters_directory: folder where raster files are stored
         - ob_metadata_file: file giving the map area names that correspond to each observation
         - obs_to_process (OPTIONAL): if you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
     """
@@ -487,7 +484,7 @@ def road_or_no(observed_steps_directory, simulated_steps_directory, rasters_dire
         # get map name and info
         full_ob_name = 'observation' + o.split('b')[-1]
         map_name = metadata[metadata['observation'] == full_ob_name]['big_map'].item()
-        roads_raster_file = os.path.join(rasters_directory,'%s_roadsraster.tif' %map_name)
+        roads_raster_file = os.path.join(rasters_directory, 'roads', '%s_roadsraster.tif' %map_name)
         roads_raster = rio.open(roads_raster_file)
         roads = roads_raster.read(1)
         originX = roads_raster.bounds[0]
@@ -511,14 +508,14 @@ def road_or_no(observed_steps_directory, simulated_steps_directory, rasters_dire
             steps.to_pickle(f)
         roads_raster.close()
 
-def step_slope(observed_steps_directory, simulated_steps_directory, map_directory, ob_metadata_file, obs_to_process = None):
+def step_slope(observed_steps_directory, simulated_steps_directory, rasters_directory, ob_metadata_file, obs_to_process = None):
     """
     Calculate the slope angle of each step
 
     Parameters:
         - observed_steps_directory: folder where the observed steps .pkl files are stored. Should be one .pkl per track.
         - simulated_steps_directory: folder where the simulated steps .pkl files are stored. Should be one .pkl per track.
-        - map_directory: folder where the mapping outputs are saved
+        - rasters_directory: folder where the raster files are stored
         - ob_metadata_file: file giving the map area names that correspond to each observation
         - obs_to_process (OPTIONAL): if you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
     """
@@ -541,7 +538,7 @@ def step_slope(observed_steps_directory, simulated_steps_directory, map_director
         # get map name and info
         full_ob_name = 'observation' + o.split('b')[-1]
         map_name = metadata[metadata['observation'] == full_ob_name]['big_map'].item()
-        DTM = os.path.join(map_directory, map_name, '3_dsm_ortho', 'extras', 'dtm', '%s_dtm.tif' %map_name)
+        DTM = os.path.join(rasters_directory, 'DTMS', '%s_dtm.tif' %map_name)
         dtm = rio.open(DTM)
         alts = dtm.read(1)
         min_x, min_y, max_x, max_y = dtm.bounds
@@ -618,7 +615,7 @@ def step_slope(observed_steps_directory, simulated_steps_directory, map_director
             steps.to_pickle(f)
         dtm.close()
 
-def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tracks_directory, rasters_directory, map_directory, ob_metadata_file, track_metadata_file, obs_to_process = None):
+def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tracks_directory, rasters_directory, ob_metadata_file, track_metadata_file, obs_to_process = None):
     """
     Get information on the focal animal's relationship (distance, visibility) to other group mates at each step location
 
@@ -626,8 +623,7 @@ def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tra
         - observed_steps_directory: folder where the observed steps .pkl files are stored. Should be one .pkl per track.
         - simulated_steps_directory: folder where the simulated steps .pkl files are stored. Should be one .pkl per track.
         - raw_tracks_directory: folder where the raw trajectories are stored. Should be one .npy per observation.
-        - rasters_directory: folder where generated raster files (zebra height rasters) are saved
-        - map_directory: folder where the mapping ouputs are saved
+        - rasters_directory: folder where raster files are stored
         - ob_metadata_file: file giving the map area names that correspond to each observation
         - obs_to_process (OPTIONAL): if you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
     """
@@ -656,7 +652,7 @@ def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tra
         map_name = metadata[metadata['observation'] == full_ob_name]['big_map'].item()
 
         # get zebra heights raster & info
-        obheights_raster = os.path.join(rasters_directory,'%s_ZebraHeights_1-5m.tif' %map_name)
+        obheights_raster = os.path.join(rasters_directory, 'zebra_heights', '%s_ZebraHeights_1-5m.tif' %map_name)
         obheights_raster = rio.open(obheights_raster)
         obheights = obheights_raster.read(1)
         originX = obheights_raster.bounds[0]
@@ -665,7 +661,7 @@ def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tra
         cellSizeY = obheights_raster.transform[4]
 
         # get DSM raster and info
-        dsm_raster = os.path.join(map_directory, map_name, '3_dsm_ortho', '1_dsm', '%s_dsm.tif' %map_name)
+        dsm_raster = os.path.join(rasters_directory, 'DSMs', '%s_dsm.tif' %map_name)
         dsm = rio.open(dsm_raster)
         dsm_rio = dsm.read(1)
         dsmX = dsm.bounds[0]
