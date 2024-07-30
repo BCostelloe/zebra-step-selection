@@ -206,6 +206,7 @@ def simulate_fake_steps(n_steps, observed_steps_directory, save_directory, raste
             step_file = pd.read_pickle(f)
             #obs = f.split('/')[-1].split('_')[0]
             track = f.split('/')[-1].split('_')[1]
+            track_num = int(track.split('k')[-1])
     
             # get observed step locations
             points = step_file[['lon', 'lat']].to_numpy()
@@ -242,8 +243,8 @@ def simulate_fake_steps(n_steps, observed_steps_directory, save_directory, raste
                 new_df = pd.DataFrame(zip(times, lats, lons), columns = ['frame', 'lat', 'lon'])
                 new_df['step_type'] = 'simulated'
                 new_df['count'] = new_df.groupby('frame').cumcount()
-                new_df['id'] = [str(o + '_' + track + '_f' + str(frame) + '_sim-' + str(count)) for frame, count in zip(new_df['frame'],new_df['count'])]
-                new_df['target_id'] = [str(o + '_' + track + '_f' + str(frame) + '_ob') for frame in new_df['frame']]
+                new_df['id'] = [str(o + '_' + str(track_num) + '_f' + str(frame) + '_sim-' + str(count)) for frame, count in zip(new_df['frame'],new_df['count'])]
+                new_df['target_id'] = [str(o + '_' + str(track_num) + '_f' + str(frame) + '_ob') for frame in new_df['frame']]
                 new_df.drop(['count'], inplace=True, axis=1)
                 #full_df = pd.concat([step_file, new_df], ignore_index = True)
                 
