@@ -1,9 +1,5 @@
 pandas
 torch
-numpy
-osgeo
+numpy<2.0.0
+gdal>=3.9.0
 rasterio
-pickle
-os
-glob
-utm
