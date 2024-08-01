@@ -1,5 +1,5 @@
 pandas
 torch
-numpy
+numpy<=2.0.1
 gdal>=3.9.0
 rasterio
