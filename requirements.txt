@@ -3,7 +3,3 @@ torch
 numpy
 osgeo
 rasterio
-pickle
-os
-glob
-utm
