@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 import numpy as np
 
 class ZebraDataset(Dataset):
-    def __init__(self, target_dir, reference_dir, rasters_dir, ob_metadata_file, viewshed_radius, viewshed_hw, threads, social_radius, target_id_col='target_id', columns_to_keep = None):
+    def __init__(self, target_dir, reference_dir, rasters_dir, ob_metadata_file, viewshed_radius, viewshed_hw, threads, social_radius, num_ref_steps, target_id_col='target_id', columns_to_keep = None):
         target_files = glob.glob(os.path.join(target_dir, '*.pkl'))
         target_df = pd.concat((pd.read_pickle(f) for f in target_files), ignore_index = True)
         target_df = target_df[target_df.prev_step.str.contains('_', na= False)]
@@ -24,6 +24,7 @@ class ZebraDataset(Dataset):
         self.threads = threads
         self.viewshed_hw = viewshed_hw
         self.social_radius = social_radius
+        self.num_ref_steps = num_ref_steps
 
         # Create mapping of target ID to reference indices
         self.id_to_ref_indices = self._create_id_to_ref_indices()
@@ -45,6 +46,7 @@ class ZebraDataset(Dataset):
         target_id = target_row[self.target_id_col]
         reference_indices = self.id_to_ref_indices.get(target_id, [])
         reference_rows = self.reference_df.iloc[reference_indices].copy()
+        reference_rows = reference_rows.sample(self.num_ref_steps)
         observation_name = 'observation' + target_id.split('_')[0].split('b')[1]
 
         # Generate and downsample viewshed
@@ -75,13 +77,13 @@ class ZebraDataset(Dataset):
         reference_rows['visibility'] = visibilities
         reference_rows['vis_array'] = vis_arrays
 
-        # Calculate social density
-        target_row['social_dens'] = sum(i < self.social_radius for i in target_row['neighbor_distances'])
-        reference_rows['social_dens'] = reference_rows['neighbor_distances'].apply(lambda x: sum(val < self.social_radius for val in x))
+        # # Calculate social density
+        # target_row['social_dens'] = sum(i < self.social_radius for i in target_row['neighbor_distances'])
+        # reference_rows['social_dens'] = reference_rows['neighbor_distances'].apply(lambda x: sum(val < self.social_radius for val in x))
 
-        # Calculate proportion of group that is visible
-        target_row['social_vis'] = sum(i ==True for i in target_row['neighbor_visibility'])/sum(~np.isnan(i) for i in target_row['neighbor_visibility'])
-        reference_rows['social_vis'] = reference_rows['neighbor_visibility'].apply(lambda x: sum(val == True for val in x)/sum(~np.isnan(val) for val in x))
+        # # Calculate proportion of group that is visible
+        # target_row['social_vis'] = sum(i ==True for i in target_row['neighbor_visibility'])/sum(~np.isnan(i) for i in target_row['neighbor_visibility'])
+        # reference_rows['social_vis'] = reference_rows['neighbor_visibility'].apply(lambda x: sum(val == True for val in x)/sum(~np.isnan(val) for val in x))
         
         # keep only specified columns and convert to dictionary
         if self.columns_to_keep:
@@ -98,7 +100,7 @@ def custom_collate(batch):
     return targets, references
 
 class ZebraBatchSampler(Sampler):
-    def __init__(self, dataset, batch_size = 1):
+    def __init__(self, dataset, batch_size = 10):
         self.dataset = dataset
         self.batch_size = batch_size
         self.num_samples = len(dataset)
