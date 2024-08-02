@@ -10,7 +10,7 @@ from tqdm.notebook import tqdm
 import utm
 from osgeo import gdal
 
-def extract_observed_steps(step_length, raw_tracks_directory, save_directory, obs_to_process = None):
+def extract_observed_steps(step_length, raw_tracks_directory, save_directory, rasters_directory, ob_metadata_file = None, obs_to_process = None):
     """
     Spatially discretizes observed trajectories
 
@@ -18,22 +18,46 @@ def extract_observed_steps(step_length, raw_tracks_directory, save_directory, ob
         - step_length: the minimum step length (in meters)
         - raw_tracks_directory: folder where trajectory data for each observation is stored. Should be one .npy per observation.
         - save_directory: where to save the resulting dataframes.
+        - rasters_directory: where the raster files are stored.
+        - ob_metadata_file (OPTIONAL): .csv file containing metadata for each observation. If included, each step point will be checked to make sure it is within the map boundaries
         - obs_to_process (OPTIONAL): if you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
     """
-    # Get files to process
+
+    # Load metadata file
+    metadata = pd.read_csv(ob_metadata_file)
+
+    # Get list of observations to process
     if obs_to_process is None:
         raw_tracks_files = sorted(glob.glob(os.path.join(raw_tracks_directory, '*.npy')))
-    else:
-        raw_tracks_files = []
-        for o in obs_to_process:
-            files = sorted(glob.glob(os.path.join(raw_tracks_directory, '%s*.npy' %o)))
-            raw_tracks_files.extend(files)
-    ## good up to here, need to edit rest of function
-    for f in tqdm(raw_tracks_files):
-        file = np.load(f, allow_pickle = True)
-        for t, track in enumerate(file):
-            new_filename = str(f.split('/')[-1].split('_')[0] + '_track' + '{:02}'.format(t) + '_%imsteps.pkl' %step_length)
+        observations = []
+        for f in raw_tracks_files:
             obs = f.split('/')[-1].split('_')[0]
+            observations = np.append(observations, obs)
+            observations = np.unique(observations)
+    else:
+        observations = obs_to_process
+
+    # For each observation...
+    for o in tqdm(observations):
+        if ob_metadata_file:
+        # Get map name and info
+            full_ob_name = 'observation' + o.split('b')[-1]
+            map_name = metadata[metadata['observation'] == full_ob_name]['big_map'].item()
+            dsm_file = os.path.join(rasters_directory, 'DSMs', map_name + '_dsm.tif')
+            DSM = rio.open(dsm_file)
+            dsm = DSM.read(1)
+            originX = DSM.bounds[0]
+            originY = DSM.bounds[3]
+            cellSizeX = DSM.transform[0]
+            cellSizeY = DSM.transform[4]
+
+        # Get tracks files to process
+        raw_tracks = os.path.join(raw_tracks_directory, '%s_utm_tracks.npy' %o)
+        file = np.load(raw_tracks, allow_pickle = True)
+
+        for t, track in enumerate(file):
+            new_filename = str(raw_tracks.split('/')[-1].split('_')[0] + '_track' + '{:02}'.format(t) + '_%imsteps.pkl' %step_length)
+            obs = raw_tracks.split('/')[-1].split('_')[0]
             new_file = os.path.join(save_directory, new_filename)
             steps = []
             frames = []
@@ -43,14 +67,51 @@ def extract_observed_steps(step_length, raw_tracks_directory, save_directory, ob
             frames.append(first_step)
             for n, i in enumerate(track):
                 if dist(i, ref_point) > step_length:
-                    ref_point = i
-                    steps.append(ref_point)
-                    frames.append(n)
+                    if ob_metadata_file:
+                        col = int((i[0] - originX)/cellSizeX)
+                        row = int((i[1] - originY)/cellSizeY)
+                        DSM_val = dsm[row,col]
+                        if DSM_val == -10000:
+                            continue
+                        else:
+                            ref_point = i
+                            steps.append(ref_point)
+                            frames.append(n)
+                    else:
+                        steps.append(ref_point)
+                        frames.append(n)
             lons = [i[0] for i in steps]
             lats = [i[1] for i in steps]
             ids = [str(obs + '_' + str(t) + '_f' + str(p) + '_ob') for p in frames]
             new_df = pd.DataFrame(zip(frames, lats, lons, ids, ids), columns = ['frame', 'lat', 'lon', 'target_id', 'id'])
             new_df.to_pickle(new_file)
+        if ob_metadata_file:
+            DSM.close()
+
+
+    
+    # for f in tqdm(raw_tracks_files):
+    #     file = np.load(f, allow_pickle = True)
+    #     for t, track in enumerate(file):
+    #         new_filename = str(f.split('/')[-1].split('_')[0] + '_track' + '{:02}'.format(t) + '_%imsteps.pkl' %step_length)
+    #         obs = f.split('/')[-1].split('_')[0]
+    #         new_file = os.path.join(save_directory, new_filename)
+    #         steps = []
+    #         frames = []
+    #         first_step = np.min(np.where(np.isfinite(track))[0])
+    #         ref_point = track[first_step]
+    #         steps.append(ref_point)
+    #         frames.append(first_step)
+    #         for n, i in enumerate(track):
+    #             if dist(i, ref_point) > step_length:
+    #                 ref_point = i
+    #                 steps.append(ref_point)
+    #                 frames.append(n)
+    #         lons = [i[0] for i in steps]
+    #         lats = [i[1] for i in steps]
+    #         ids = [str(obs + '_' + str(t) + '_f' + str(p) + '_ob') for p in frames]
+    #         new_df = pd.DataFrame(zip(frames, lats, lons, ids, ids), columns = ['frame', 'lat', 'lon', 'target_id', 'id'])
+    #         new_df.to_pickle(new_file)
 
 def calculate_full_angles(points): # from ChatGPT
     """
@@ -235,6 +296,7 @@ def simulate_fake_steps(n_steps, observed_steps_directory, save_directory, raste
         
                 for ob in simulated_points.keys():
                     for i in simulated_points[ob]:
+                        #print(i)
                         lats.append(i[1])
                         lons.append(i[0])
                         time = step_file.loc[((step_file['lat'] == ob[1]) & (step_file['lon'] == ob[0])), 'frame'].item()
@@ -616,7 +678,7 @@ def step_slope(observed_steps_directory, simulated_steps_directory, rasters_dire
             steps.to_pickle(f)
         dtm.close()
 
-def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tracks_directory, rasters_directory, ob_metadata_file, track_metadata_file, obs_to_process = None):
+def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tracks_directory, rasters_directory, social_radius, ob_metadata_file, track_metadata_file, obs_to_process = None):
     """
     Get information on the focal animal's relationship (distance, visibility) to other group mates at each step location
 
@@ -625,6 +687,7 @@ def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tra
         - simulated_steps_directory: folder where the simulated steps .pkl files are stored. Should be one .pkl per track.
         - raw_tracks_directory: folder where the raw trajectories are stored. Should be one .npy per observation.
         - rasters_directory: folder where raster files are stored
+        - social_radius: radius (meters) within which to calculate social density (number of animals within given radius)
         - ob_metadata_file: file giving the map area names that correspond to each observation
         - obs_to_process (OPTIONAL): if you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
     """
@@ -738,14 +801,23 @@ def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tra
                             neighbor_points.append(neighbor_point)
                             neighbor_distances.append(np.nan)
                             neighbor_visibilities.append(np.nan)
-            
+
+                # Calculate social density
+                social_dens = sum(i < social_radius for i in neighbor_distances)
+                if np.isnan(neighbor_visibilities).all():
+                    social_vis = 0
+                else:
+                    social_vis = sum(i == True for i in neighbor_visibilities)/sum(~np.isnan(i) for i in neighbor_visibilities)
+        
                 # Create dictionary with keys for step ID, neighbor IDs, neighbor distances, neighbor visibilities 
                 social_dict = {'step_id': step_id, 
                                'neighbor_ids': neighbor_ids, 
                                'neighbor_spps': neighbor_spps,
                                'neighbor_points': neighbor_points, 
                                'neighbor_distances': neighbor_distances,
-                               'neighbor_visibility': neighbor_visibilities
+                               'neighbor_visibility': neighbor_visibilities,
+                               'social_dens': social_dens,
+                               'social_vis': social_vis
                               }
                     # Store dictionary in social_dat list
                 social_dat.append(social_dict)
@@ -755,6 +827,8 @@ def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tra
             steps['neighbor_points'] = [x['neighbor_points'] if x['step_id'] == y else np.nan for x, y in zip(social_dat, steps['id'])]
             steps['neighbor_distances'] = [x['neighbor_distances'] if x['step_id'] == y else np.nan for x, y in zip(social_dat, steps['id'])]
             steps['neighbor_visibility'] = [x['neighbor_visibility'] if x['step_id'] == y else np.nan for x, y in zip(social_dat, steps['id'])]
+            steps['social_dens'] = [x['social_dens'] if x['step_id'] == y else np.nan for x, y in zip(social_dat, steps['id'])]
+            steps['social_vis'] = [x['social_vis'] if x['step_id'] == y else np.nan for x, y in zip(social_dat, steps['id'])]
             
             steps.to_pickle(f)
         obheights_raster.close()
