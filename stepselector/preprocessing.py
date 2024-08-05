@@ -84,7 +84,8 @@ def extract_observed_steps(step_length, raw_tracks_directory, save_directory, ra
             lats = [i[1] for i in steps]
             ids = [str(obs + '_' + str(t) + '_f' + str(p) + '_ob') for p in frames]
             new_df = pd.DataFrame(zip(frames, lats, lons, ids, ids), columns = ['frame', 'lat', 'lon', 'target_id', 'id'])
-            new_df.to_pickle(new_file)
+            if len(new_df) >=5: # only keep tracks with at least 5 steps
+                new_df.to_pickle(new_file)
         if ob_metadata_file:
             DSM.close()
 
@@ -804,10 +805,12 @@ def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tra
 
                 # Calculate social density
                 social_dens = sum(i < social_radius for i in neighbor_distances)
-                if np.isnan(neighbor_visibilities).all():
-                    social_vis = 0
-                else:
-                    social_vis = sum(i == True for i in neighbor_visibilities)/sum(~np.isnan(i) for i in neighbor_visibilities)
+                # Calculate social visibility
+                social_vis = sum(i == True for i in neighbor_visibilities) # count of other animals that are visible
+                # if np.isnan(neighbor_visibilities).all(): # proportion of animals that are present that are visible
+                #     social_vis = 0
+                # else:
+                #     social_vis = sum(i == True for i in neighbor_visibilities)/sum(~np.isnan(i) for i in neighbor_visibilities)
         
                 # Create dictionary with keys for step ID, neighbor IDs, neighbor distances, neighbor visibilities 
                 social_dict = {'step_id': step_id, 
