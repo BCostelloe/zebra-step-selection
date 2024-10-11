@@ -662,7 +662,7 @@ def calculate_zebra_heights(observed_steps_directory, simulated_steps_directory,
 
 def road_or_no(observed_steps_directory, simulated_steps_directory, rasters_directory, ob_metadata_file, obs_to_process = None):
     """
-    Calculate sample a pre-generated roads raster to determine if a given point is on a rod
+    Sample a pre-generated roads raster to determine if a given point is on a road
 
     Parameters:
         - observed_steps_directory: folder where the observed steps .pkl files are stored. Should be one .pkl per track.
@@ -980,6 +980,55 @@ def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tra
             steps.to_pickle(f)
         obheights_raster.close()
         dataset = None
+
+
+def get_ground_cover(observed_steps_directory, simulated_steps_directory, rasters_directory, obs_to_process = None):
+    """
+    Sample a pre-generated groundcover raster to determine whether the location is on bare ground, grass, or under a tree.
+
+    Parameters:
+        - observed_steps_directory: folder where the observed steps .pkl files are stored. Should be one .pkl per track.
+        - simulated_steps_directory: folder where the simulated steps .pkl files are stored. Should be one .pkl per track.
+        - rasters_directory: folder where raster files are stored
+        - obs_to_process (OPTIONAL): if you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
+    """
+    
+    # Define observations to be processed
+    if obs_to_process is None:
+        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '*.pkl')))
+        observations = []
+        for f in observed_step_files:
+            obs = f.split('/')[-1].split('_')[0]
+            observations = np.append(observations, obs)
+            observations = np.unique(observations)
+    else:
+        observations = obs_to_process
+
+
+    for o in tqdm(observations):
+        # using 50cm resolution ground cover layers
+        class_raster_file = os.path.join(rasters_directory, 'ground_classification', '%s_groundclass_50cm.tif' %o)
+        class_raster = rio.open(class_raster_file)
+        ground_class = class_raster.read(1)
+        originX = class_raster.bounds[0]
+        originY = class_raster.bounds[3]
+        cellSizeX = class_raster.transform[0]
+        cellSizeY = class_raster.transform[4]
+        class_raster.close()
+
+        # get step files
+        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '%s*.pkl' %o)))
+        simulated_step_files = sorted(glob.glob(os.path.join(simulated_steps_directory, '%s*.pkl' %o)))
+        step_files = observed_step_files + simulated_step_files
+
+        for f in step_files:
+            steps = pd.read_pickle(f)
+            cols = [int((x - originX)/cellSizeX) for x in steps['lon']]
+            rows = [int((y - originY)/cellSizeY) for y in steps['lat']]
+            steps['ground_class'] = [ground_class[row,col] for row,col in zip(rows, cols)]
+            steps['ground_class'] = steps['ground_class'].astype('int32')
+
+            steps.to_pickle(f)
 
 ### I don't think the things below this line are used in the pipeline:
 def calculate_initial_compass_bearing(pointA, pointB): # adjusted from source: https://gist.github.com/jeromer/2005586
