@@ -1027,8 +1027,54 @@ def get_ground_cover(observed_steps_directory, simulated_steps_directory, raster
             rows = [int((y - originY)/cellSizeY) for y in steps['lat']]
             steps['ground_class'] = [ground_class[row,col] for row,col in zip(rows, cols)]
             steps['ground_class'] = steps['ground_class'].astype('int32')
+            steps.to_pickle(f)
+
+def get_track_info(observed_steps_directory, simulated_steps_directory, track_metadata_file, obs_to_process = None):
+    """
+    Get information on the focal animal
+
+    Parameters:
+        - observed_steps_directory: folder where the observed steps .pkl files are stored. Should be one .pkl per track.
+        - simulated_steps_directory: folder where the simulated steps .pkl files are stored. Should be one .pkl per track.
+        - track_metadata_file: file giving the individual ID, species and age class that correspond to each track
+        - obs_to_process (OPTIONAL): if you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
+    """
+    # Load metadata file
+    track_metadata = pd.read_csv(track_metadata_file)
+    
+    # Define observations to be processed
+    if obs_to_process is None:
+        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '*.pkl')))
+        observations = []
+        for f in observed_step_files:
+            obs = f.split('/')[-1].split('_')[0]
+            observations = np.append(observations, obs)
+            observations = np.unique(observations)
+    else:
+        observations = obs_to_process
+
+    for o in tqdm(observations):
+        # get step files
+        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '%s*.pkl' %o)))
+        simulated_step_files = sorted(glob.glob(os.path.join(simulated_steps_directory, '%s*.pkl' %o)))
+        step_files = observed_step_files + simulated_step_files
+        full_ob_name = 'observation' + o.split('b')[-1]
+
+        for f in step_files:
+            steps = pd.read_pickle(f)
+            
+            track = int(f.split('/')[-1].split('_')[1].split('k')[1])
+            indID = track_metadata[(track_metadata['observation']==full_ob_name) & (track_metadata['track'] == track)]['individual_ID'].item()
+            spp = track_metadata[(track_metadata['observation']==full_ob_name) & (track_metadata['track'] == track)]['species'].item()
+            age = track_metadata[(track_metadata['observation']==full_ob_name) & (track_metadata['track'] == track)]['age'].item()
+
+            steps['observation'] = full_ob_name
+            steps['individual_ID'] = indID
+            steps['species'] = spp
+            steps['age_class'] = age
 
             steps.to_pickle(f)
+
 
 ### I don't think the things below this line are used in the pipeline:
 def calculate_initial_compass_bearing(pointA, pointB): # adjusted from source: https://gist.github.com/jeromer/2005586
