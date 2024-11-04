@@ -59,6 +59,7 @@ class ZebraDataset(Dataset):
                                                                     viewshed_hw = self.viewshed_hw)
         target_row['visibility'] = target_vis
         target_row['vis_array'] = target_vis_array
+        target_row['observation'] = observation_name
 
         visibilities = []
         vis_arrays = []
@@ -76,6 +77,7 @@ class ZebraDataset(Dataset):
             vis_arrays.append(ref_vis_array)
         reference_rows['visibility'] = visibilities
         reference_rows['vis_array'] = vis_arrays
+        reference_rows['observation'] = observation_name
 
         # # Calculate social density
         # target_row['social_dens'] = sum(i < self.social_radius for i in target_row['neighbor_distances'])
