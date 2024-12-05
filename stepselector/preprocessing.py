@@ -9,6 +9,8 @@ import pickle
 from tqdm.notebook import tqdm
 import utm
 from osgeo import gdal
+import datetime
+from pathlib import Path
 
 def extract_observed_steps(step_length, raw_tracks_directory, save_directory, rasters_directory, ob_metadata_file = None, obs_to_process = None):
     """
@@ -1075,6 +1077,99 @@ def get_track_info(observed_steps_directory, simulated_steps_directory, track_me
 
             steps.to_pickle(f)
 
+
+def generate_viewshed(dsm_file, X, Y, height, targetRasterName, radius, threads):
+    src_ds = gdal.Open(dsm_file)      
+    srcBand = src_ds.GetRasterBand(1)
+    c_options = ['NUM_THREADS=%i' %threads, 'COMPRESS=PACKBITS']
+    
+    gdal.ViewshedGenerate(
+        srcBand=srcBand,
+        driverName="GTIFF",
+        targetRasterName=targetRasterName,
+        creationOptions=c_options,
+        observerX=X,
+        observerY=Y,
+        observerHeight=height,
+        targetHeight=0,
+        visibleVal=1,
+        invisibleVal=0,
+        outOfRangeVal=-10000,
+        noDataVal=-10000,
+        dfCurvCoeff=0.85714,
+        mode=1,
+        maxDistance=radius
+    )
+    src_ds = None
+
+def preprocess_viewsheds(observed_steps_directory, simulated_steps_directory, viewshed_save_directory, ob_metadata_file, radius, threads, map_directory, obs_to_process = None, keep_rasters = True):
+    """
+    Generate and save a viewshed raster for each step location.
+
+    Parameters:
+        - observed_steps_directory: folder where the observed steps .pkl files are stored. Should be one .pkl per track.
+        - simulated_steps_directory: folder where the simulated steps .pkl files are stored. Should be one .pkl per track.
+        - viewshed_save_directory: where to save the generated viewsheds
+        - ob_metadata_file: file giving the map area names that correspond to each observation
+        - obs_to_process (OPTIONAL): if you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
+        - radius: radius of the viewshed circle, in meters
+        - threads: number of processors to use to calculate the viewsheds.
+    """
+    # Load metadata file
+    metadata = pd.read_csv(ob_metadata_file)
+
+    # Get list of observations to process
+    if obs_to_process is None:
+        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '*.pkl')))
+        observations = []
+        for f in observed_step_files:
+            obs = f.split('/')[-1].split('_')[0]
+            observations = np.append(observations, obs)
+            observations = np.unique(observations)
+    else:
+        observations = obs_to_process
+
+    for o in observations:
+        # get map name
+        full_ob_name = 'observation' + o.split('b')[-1]
+        map_name = metadata[metadata['observation'] == full_ob_name]['big_map'].item()
+        
+        # load dsm
+        dsm_file = os.path.join(map_directory, map_name, '3_dsm_ortho', '1_dsm', '%s_dsm.tif' %map_name)
+
+        # get step files
+        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '%s*.pkl' %o)))
+        simulated_step_files = sorted(glob.glob(os.path.join(simulated_steps_directory, '%s*.pkl' %o)))
+        step_files = observed_step_files + simulated_step_files
+        step_files = sorted(step_files)
+    
+        for f in step_files:
+            start_time = datetime.datetime.now()
+            print('starting ' + f + ': ', start_time)
+            steps = pd.read_pickle(f)
+            track = f.split('/')[-1].split('_')[1]
+            Xs = [x for x in steps['lon']]
+            Ys = [y for y in steps['lat']]
+            height = [h for h in steps['observer_height']]
+            src_ds = gdal.Open(dsm_file)
+            srcBand = src_ds.GetRasterBand(1)
+    
+            args_list = []
+            for i in range(len(Xs)):
+                if keep_rasters:
+                    filename = steps.iloc[i]['id'] + '_viewshed%sm.tif' %radius
+                    folder = os.path.join(viewshed_save_directory, full_ob_name, track)
+                    Path(folder).mkdir(parents=True, exist_ok=True)
+                    targetRasterName = os.path.join(folder, filename)
+                else:
+                    targetRasterName = os.path.join(viewshed_save_directory, 'temp_raster.tif')
+    
+                generate_viewshed(dsm_file, Xs[i], Ys[i], height[i], targetRasterName, radius, threads)
+    
+            end_time = datetime.datetime.now()
+            #print('finished ' + f + ': ', end_time)
+            processing_time = end_time - start_time
+            print(f + ' completed. File processing time: ', processing_time)
 
 ### I don't think the things below this line are used in the pipeline:
 def calculate_initial_compass_bearing(pointA, pointB): # adjusted from source: https://gist.github.com/jeromer/2005586
