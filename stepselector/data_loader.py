@@ -4,30 +4,120 @@ import os
 from stepselector.viewshed import generate_viewshed, generate_downsample_viewshed
 from torch.utils.data import Dataset, DataLoader, Sampler
 import numpy as np
+from sklearn.preprocessing import OneHotEncoder
+from scipy.special import logit
 
-class ZebraDataset(Dataset):
-    def __init__(self, target_dir, reference_dir, rasters_dir, ob_metadata_file, viewshed_radius, viewshed_hw, threads, social_radius, num_ref_steps, target_id_col='target_id', columns_to_keep = None):
-        target_files = glob.glob(os.path.join(target_dir, '*.pkl'))
+
+class ZebraDataset(Dataset):    
+    def __init__(self, target_dir, reference_dir, social_radius, num_ref_steps, target_id_col='target_id', columns_to_keep = None):
+
+        self.columns_to_keep = columns_to_keep if columns_to_keep is not None else []
+        
+        target_files = sorted(glob.glob(os.path.join(target_dir, '*.pkl')))
         target_df = pd.concat((pd.read_pickle(f) for f in target_files), ignore_index = True)
         target_df = target_df[target_df.prev_step.str.contains('_', na= False)]
-        #df[~df.C.str.contains("XYZ")]
-        reference_files = glob.glob(os.path.join(reference_dir, '*.pkl'))
+        reference_files = sorted(glob.glob(os.path.join(reference_dir, '*.pkl')))
         reference_df = pd.concat((pd.read_pickle(f) for f in reference_files), ignore_index = True)
-        metadata_df = pd.read_csv(ob_metadata_file)
-        self.metadata_df = metadata_df
+
+        # Initialize encoders
+        onehot_encode = OneHotEncoder(sparse_output = False)
+
+        # One-hot encode ground_class
+        ground_class_df = target_df[['ground_class']].copy()
+        ground_class_onehot = onehot_encode.fit_transform(ground_class_df)
+        new_columns = ['ground_unclassified', 'ground_bare', 'ground_grass', 'ground_tree']
+        target_df[new_columns] = ground_class_onehot
+        target_df.drop(['ground_class'], axis=1, inplace=True)
+
+        ground_class_df = reference_df[['ground_class']].copy()
+        ground_class_onehot = onehot_encode.fit_transform(ground_class_df)
+        new_columns = ['ground_unclassified', 'ground_bare', 'ground_grass', 'ground_tree']
+        reference_df[new_columns] = ground_class_onehot
+        reference_df.drop(['ground_class'], axis=1, inplace=True)
+        
+        # Update columns_to_keep dynamically
+        self._update_columns_to_keep('ground_class', new_columns)
+
+        # One-hot encode species
+        species_df = target_df[['species']].copy()
+        species_onehot = onehot_encode.fit_transform(species_df)
+        species_categories = onehot_encode.categories_[0]
+        new_columns = [f"species_{s}" for s in species_categories]
+        target_df[new_columns] = species_onehot
+        target_df.drop(['species'], axis=1, inplace=True)
+
+        species_df = reference_df[['species']].copy()
+        species_onehot = onehot_encode.fit_transform(species_df)
+        species_categories = onehot_encode.categories_[0]
+        new_columns = [f"species_{s}" for s in species_categories]
+        reference_df[new_columns] = species_onehot
+        reference_df.drop(['species'], axis=1, inplace=True)
+        
+        # Update columns_to_keep dynamically
+        self._update_columns_to_keep('species', new_columns)
+
+        # One-hot encode age_class
+        age_class_df = target_df[['age_class']].copy()
+        age_class_onehot = onehot_encode.fit_transform(age_class_df)
+        age_classes = onehot_encode.categories_[0]
+        new_columns = [f"age_{a}" for a in age_classes]
+        target_df[new_columns] = age_class_onehot
+        target_df.drop(['age_class'], axis=1, inplace=True)
+
+        age_class_df = reference_df[['age_class']].copy()
+        age_class_onehot = onehot_encode.fit_transform(age_class_df)
+        age_classes = onehot_encode.categories_[0]
+        new_columns = [f"age_{a}" for a in age_classes]
+        reference_df[new_columns] = age_class_onehot
+        reference_df.drop(['age_class'], axis=1, inplace=True)
+        
+        # Update columns_to_keep dynamically
+        self._update_columns_to_keep('age_class', new_columns)
+
+        # Transform & scale data
+        cols_to_logtransform = ['step_speed_mps', 'dist_to_observer']
+        angle_cols = ['angle_to_observers']
+        cols_to_logittransform = ['angle_to_observers', 'viewshed_vis']
+        cols_to_zscore = ['step_speed_mps', 'angle_to_observers', 'dist_to_observer', 'delta_observer_dist', 'ground_slope', 'viewshed_vis']
+
+        for c in cols_to_logtransform:
+            target_df[c] = np.log1p(target_df[c])
+            reference_df[c] = np.log1p(reference_df[c])
+
+        for c in angle_cols:
+            target_df[c] = target_df[c]/180
+            reference_df[c] = reference_df[c]/180
+
+        for c in cols_to_logittransform:
+            target_df[c] = logit(target_df[c])
+            reference_df[c] = logit(reference_df[c])
+
+        for c in cols_to_zscore:
+            mean_val = np.mean(target_df[c])
+            std_val = np.std(target_df[c])
+            target_df[c] = (target_df[c] - mean_val)/std_val
+            reference_df[c] = (reference_df[c] - mean_val)/std_val
+
         self.target_df = target_df
         self.reference_df = reference_df
         self.target_id_col = target_id_col
-        self.columns_to_keep = columns_to_keep
-        self.rasters_dir = rasters_dir
-        self.viewshed_radius = viewshed_radius
-        self.threads = threads
-        self.viewshed_hw = viewshed_hw
         self.social_radius = social_radius
         self.num_ref_steps = num_ref_steps
 
         # Create mapping of target ID to reference indices
         self.id_to_ref_indices = self._create_id_to_ref_indices()
+
+    def _update_columns_to_keep(self, original_column, new_columns):
+        """
+        Update columns_to_keep by replacing an original column with new columns.
+    
+        Parameters:
+            original_column (str): The name of the original column being replaced.
+            new_columns (list): List of new columns to add in place of the original column.
+        """
+        if original_column in self.columns_to_keep:
+            self.columns_to_keep.remove(original_column)
+            self.columns_to_keep.extend(new_columns)
 
     def _create_id_to_ref_indices(self):
         id_to_ref_indices = {}
@@ -46,60 +136,30 @@ class ZebraDataset(Dataset):
         target_id = target_row[self.target_id_col]
         reference_indices = self.id_to_ref_indices.get(target_id, [])
         reference_rows = self.reference_df.iloc[reference_indices].copy()
+        
+        # # Debugging: Log the target ID and the number of available reference rows
+        # print(f"Processing target ID {target_id} with {len(reference_rows)} reference rows available.")
+        
         reference_rows = reference_rows.sample(self.num_ref_steps)
         observation_name = 'observation' + target_id.split('_')[0].split('b')[1]
-
-        # Generate and downsample viewshed
-        target_vis, target_vis_array = generate_downsample_viewshed(data_row = target_row,
-                                                                    radius = self.viewshed_radius,
-                                                                    threads = self.threads,
-                                                                    metadata_df = self.metadata_df,
-                                                                    observation_name = observation_name,
-                                                                    rasters_dir = self.rasters_dir,
-                                                                    viewshed_hw = self.viewshed_hw)
-        target_row['visibility'] = target_vis
-        target_row['vis_array'] = target_vis_array
-        target_row['observation'] = observation_name
-
-        visibilities = []
-        vis_arrays = []
-        
-        for r in np.arange(len(reference_rows)):
-            row = reference_rows.iloc[r]
-            ref_vis, ref_vis_array = generate_downsample_viewshed(data_row = row,
-                                                                  radius = self.viewshed_radius,
-                                                                  threads = self.threads,
-                                                                  metadata_df = self.metadata_df,
-                                                                  observation_name = observation_name,
-                                                                  rasters_dir = self.rasters_dir,
-                                                                  viewshed_hw = self.viewshed_hw)
-            visibilities.append(ref_vis)
-            vis_arrays.append(ref_vis_array)
-        reference_rows['visibility'] = visibilities
-        reference_rows['vis_array'] = vis_arrays
         reference_rows['observation'] = observation_name
-
-        # # Calculate social density
-        # target_row['social_dens'] = sum(i < self.social_radius for i in target_row['neighbor_distances'])
-        # reference_rows['social_dens'] = reference_rows['neighbor_distances'].apply(lambda x: sum(val < self.social_radius for val in x))
-
-        # # Calculate proportion of group that is visible
-        # target_row['social_vis'] = sum(i ==True for i in target_row['neighbor_visibility'])/sum(~np.isnan(i) for i in target_row['neighbor_visibility'])
-        # reference_rows['social_vis'] = reference_rows['neighbor_visibility'].apply(lambda x: sum(val == True for val in x)/sum(~np.isnan(val) for val in x))
+        context_rows = self.target_df.iloc[:idx].copy()
         
         # keep only specified columns and convert to dictionary
         if self.columns_to_keep:
             target_data = target_row[self.columns_to_keep].to_dict()
             reference_data = reference_rows[self.columns_to_keep].to_dict(orient='records')
+            context_data = context_rows[self.columns_to_keep].to_dict(orient='records')
         else:
             target_data = target_row.to_dict()
             reference_data = reference_rows.to_dict(orient = 'records')
+            context_data = context_rows.to_dict(orient = 'records')
 
-        return target_data, reference_data
+        return target_data, reference_data, context_data
 
 def custom_collate(batch):
-    targets, references = zip(*batch)
-    return targets, references
+    targets, references, context = zip(*batch)
+    return targets, references, context
 
 class ZebraBatchSampler(Sampler):
     def __init__(self, dataset, batch_size = 10):
