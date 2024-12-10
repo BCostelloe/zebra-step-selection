@@ -1129,7 +1129,7 @@ def preprocess_viewsheds(observed_steps_directory, simulated_steps_directory, vi
     else:
         observations = obs_to_process
 
-    for o in observations:
+    for o in tqdm(observations):
         # get map name
         full_ob_name = 'observation' + o.split('b')[-1]
         map_name = metadata[metadata['observation'] == full_ob_name]['big_map'].item()
@@ -1145,7 +1145,7 @@ def preprocess_viewsheds(observed_steps_directory, simulated_steps_directory, vi
     
         for f in step_files:
             start_time = datetime.datetime.now()
-            print('starting ' + f + ': ', start_time)
+            #print('starting ' + f + ': ', start_time)
             steps = pd.read_pickle(f)
             track = f.split('/')[-1].split('_')[1]
             Xs = [x for x in steps['lon']]
@@ -1169,7 +1169,52 @@ def preprocess_viewsheds(observed_steps_directory, simulated_steps_directory, vi
             end_time = datetime.datetime.now()
             #print('finished ' + f + ': ', end_time)
             processing_time = end_time - start_time
-            print(f + ' completed. File processing time: ', processing_time)
+            print(f.split('_steps/')[-1] + ' completed. File processing time: ', processing_time)
+
+def viewshed_visibility(observed_steps_directory, simulated_steps_directory, viewshed_save_directory, obs_to_process = None):
+    """
+    Calculate the proportion of visible pixels in a pre-generated viewshed raster.
+
+    Parameters:
+        - observed_steps_directory: folder where the observed steps .pkl files are stored. Should be one .pkl per track.
+        - simulated_steps_directory: folder where the simulated steps .pkl files are stored. Should be one .pkl per track.
+        - viewshed_save_directory: folder where pre-generated viewsheds are stored
+        - obs_to_process (OPTIONAL): if you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
+    """
+    # Define observations to be processed
+    if obs_to_process is None:
+        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '*.pkl')))
+        observations = []
+        for f in observed_step_files:
+            obs = f.split('/')[-1].split('_')[0]
+            observations = np.append(observations, obs)
+            observations = np.unique(observations)
+    else:
+        observations = obs_to_process
+
+    for o in tqdm(observations):
+        full_ob_name = 'observation' + o.split('b')[-1] 
+        # get step files
+        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '%s*.pkl' %o)))
+        simulated_step_files = sorted(glob.glob(os.path.join(simulated_steps_directory, '%s*.pkl' %o)))
+        step_files = observed_step_files + simulated_step_files
+
+        for f in step_files:
+            steps = pd.read_pickle(f)
+            track = f.split('/')[-1].split('_')[1]
+            ids = [x for x in steps['id']]
+            visibilities = []
+            for i in ids:
+                viewshed = glob.glob(os.path.join(viewshed_save_directory, full_ob_name, track, '%s*.tif' %i))
+                vs = gdal.Open(viewshed[0])
+                vshed = vs.GetRasterBand(1)
+                visibility = vshed.GetStatistics(0,1)[2]
+                visibilities.append(visibility)
+                vs = None
+
+            steps['viewshed_vis'] = visibilities
+
+            steps.to_pickle(f)
 
 ### I don't think the things below this line are used in the pipeline:
 def calculate_initial_compass_bearing(pointA, pointB): # adjusted from source: https://gist.github.com/jeromer/2005586
