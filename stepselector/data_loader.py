@@ -1,7 +1,6 @@
 import pandas as pd
 import glob
 import os
-from stepselector.viewshed import generate_viewshed, generate_downsample_viewshed
 from torch.utils.data import Dataset, DataLoader, Sampler
 import numpy as np
 from sklearn.preprocessing import OneHotEncoder
