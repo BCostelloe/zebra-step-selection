@@ -8,13 +8,13 @@ from scipy.special import logit
 
 
 class ZebraDataset(Dataset):    
-    def __init__(self, target_dir, reference_dir, social_radius, num_ref_steps, target_id_col='target_id', columns_to_keep = None):
+    def __init__(self, target_dir, reference_dir, social_radius, num_ref_steps, num_context_steps, target_id_col='target_id', columns_to_keep = None):
 
         self.columns_to_keep = columns_to_keep if columns_to_keep is not None else []
-        
+        self.num_context_steps = 5
+
         target_files = sorted(glob.glob(os.path.join(target_dir, '*.pkl')))
-        target_df = pd.concat((pd.read_pickle(f) for f in target_files), ignore_index = True)
-        target_df = target_df[target_df.prev_step.str.contains('_', na= False)]
+        target_df = pd.concat((pd.read_pickle(f) for f in target_files), ignore_index = False)
         reference_files = sorted(glob.glob(os.path.join(reference_dir, '*.pkl')))
         reference_df = pd.concat((pd.read_pickle(f) for f in reference_files), ignore_index = True)
 
@@ -97,11 +97,22 @@ class ZebraDataset(Dataset):
             target_df[c] = (target_df[c] - mean_val)/std_val
             reference_df[c] = (reference_df[c] - mean_val)/std_val
 
-        self.target_df = target_df
+        
+        keep = []
+        tracks = np.unique([x.split('f')[0] for x in target_df['id']])
+        target_df['track_id'] = [x.split('f')[0] for x in target_df['id']]
+        self.context_df = target_df.copy() # full target dataset is available to use as context
+        for t in tracks:
+            sub_data = target_df[target_df['track_id'] == t].iloc[self.num_context_steps:].copy()
+            keep.append(sub_data)
+        new_target_df = pd.concat(keep)
+        
+        self.new_target_df = new_target_df
         self.reference_df = reference_df
         self.target_id_col = target_id_col
         self.social_radius = social_radius
         self.num_ref_steps = num_ref_steps
+        self.num_samples = len(self.new_target_df)
 
         # Create mapping of target ID to reference indices
         self.id_to_ref_indices = self._create_id_to_ref_indices()
@@ -128,11 +139,12 @@ class ZebraDataset(Dataset):
         return id_to_ref_indices
             
     def __len__(self):
-        return len(self.target_df)
+        return len(self.new_target_df)
 
     def __getitem__(self, idx):
-        target_row = self.target_df.iloc[idx].copy()
+        target_row = self.new_target_df.iloc[idx].copy()
         target_id = target_row[self.target_id_col]
+        track_id = target_id.split('f')[0]
         reference_indices = self.id_to_ref_indices.get(target_id, [])
         reference_rows = self.reference_df.iloc[reference_indices].copy()
         
@@ -142,7 +154,9 @@ class ZebraDataset(Dataset):
         reference_rows = reference_rows.sample(self.num_ref_steps)
         observation_name = 'observation' + target_id.split('_')[0].split('b')[1]
         reference_rows['observation'] = observation_name
-        context_rows = self.target_df.iloc[:idx].copy()
+        context = self.context_df[self.context_df['track_id'] == track_id]
+        target_index = self.context_df.index[self.context_df['id'] == target_id][0]
+        context_rows = self.context_df.iloc[(target_index-self.num_context_steps):target_index,:].copy()
         
         # keep only specified columns and convert to dictionary
         if self.columns_to_keep:
@@ -157,18 +171,5 @@ class ZebraDataset(Dataset):
         return target_data, reference_data, context_data
 
 def custom_collate(batch):
-    targets, references, context = zip(*batch)
-    return targets, references, context
-
-class ZebraBatchSampler(Sampler):
-    def __init__(self, dataset, batch_size = 10):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.num_samples = len(dataset)
-
-    def __iter__(self):
-        for i in range(self.num_samples):
-            yield [i]
-
-    def __len__(self):
-        return self.num_samples
+        targets, references, context = zip(*batch)
+        return targets, references, context
