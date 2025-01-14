@@ -11,7 +11,7 @@ class ZebraDataset(Dataset):
     def __init__(self, target_dir, reference_dir, social_radius, num_ref_steps, num_context_steps, target_id_col='target_id', columns_to_keep = None):
 
         self.columns_to_keep = columns_to_keep if columns_to_keep is not None else []
-        self.num_context_steps = 5
+        self.num_context_steps = num_context_steps
 
         target_files = sorted(glob.glob(os.path.join(target_dir, '*.pkl')))
         target_df = pd.concat((pd.read_pickle(f) for f in target_files), ignore_index = False)

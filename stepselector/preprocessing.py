@@ -476,8 +476,8 @@ def get_observer_and_step_info(observed_steps_directory, simulated_steps_directo
             
                             # While we're here, let's calculate the step length, time duration and speed
                             step_length_m = dist((start_lon, start_lat), (step_end_lon, step_end_lat))
-                            start_frame = times[t-1]
-                            step_duration_s = (times[t] - times[t-1])/30
+                            start_frame = ref_times[t]
+                            step_duration_s = (times[t] - start_frame)/30
                             step_speed_mps = step_length_m/step_duration_s
             
                             data.loc[index, 'prev_step'] = start_step
@@ -485,8 +485,9 @@ def get_observer_and_step_info(observed_steps_directory, simulated_steps_directo
                             data.loc[index, 'step_duration_s'] = step_duration_s
                             data.loc[index, 'step_speed_mps'] = step_speed_mps
 
-            data = data[['frame', 'lat', 'lon', 'id', 'target_id', 'angle_to_observers', 'dist_to_observer', 'delta_observer_dist', 'prev_step', 
-                        'step_length_m', 'step_duration_s', 'step_speed_mps']]
+            # data = data[['frame', 'lat', 'lon', 'id', 'target_id', 'angle_to_observers', 'dist_to_observer', 'delta_observer_dist', 'prev_step', 
+            #             'step_length_m', 'step_duration_s', 'step_speed_mps']]
+            data.drop(['observers_lat', 'observers_lon'], axis=1, inplace=True)
             data.to_pickle(f)
 
 # def get_observer_and_step_info(observed_steps_directory, simulated_steps_directory, ob_metadata_file, obs_to_process = None):
