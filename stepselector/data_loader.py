@@ -178,9 +178,6 @@ class ZebraDataset(Dataset):
             for col in transformations["angle"]:
                 df[f"{col}_transformed"] = df[col] / 180
 
-        # Combine DataFrames to calculate Z-score statistics
-        combined_df = pd.concat([target_df, reference_df])
-
         # Apply Z-score normalization
         for df in [target_df, reference_df]:
             for col in transformations["zscore"]:
@@ -190,9 +187,9 @@ class ZebraDataset(Dataset):
                 if transformed_col_name not in df.columns:
                     df[transformed_col_name] = df[col]
 
-                # Compute Z-score stats from the combined DataFrame
-                combined_mean = combined_df[transformed_col_name].mean()
-                combined_std = combined_df[transformed_col_name].std()
+                # Compute Z-score stats from the target DataFrame
+                combined_mean = target_df[transformed_col_name].mean()
+                combined_std = target_df[transformed_col_name].std()
 
                 # Normalize the transformed version
                 df[transformed_col_name] = (
