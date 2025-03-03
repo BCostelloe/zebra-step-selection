@@ -51,7 +51,6 @@ class ZebraDataset(Dataset):
         self,
         target_dir,
         reference_dir,
-        social_radius,
         num_ref_steps,
         num_context_steps,
         target_id_col="target_id",
@@ -187,9 +186,14 @@ class ZebraDataset(Dataset):
                 if transformed_col_name not in df.columns:
                     df[transformed_col_name] = df[col]
 
+        combined_df = pd.concat([target_df, reference_df], axis=0)
+
+        for df in [target_df, reference_df]:
+            for col in transformations["zscore"]:
+                transformed_col_name = f"{col}_transformed"
                 # Compute Z-score stats from the target DataFrame
-                combined_mean = target_df[transformed_col_name].mean()
-                combined_std = target_df[transformed_col_name].std()
+                combined_mean = combined_df[transformed_col_name].mean()
+                combined_std = combined_df[transformed_col_name].std()
 
                 # Normalize the transformed version
                 df[transformed_col_name] = (
@@ -208,7 +212,6 @@ class ZebraDataset(Dataset):
 
         self.reference_df = reference_df
         self.target_id_col = target_id_col
-        self.social_radius = social_radius
         self.num_ref_steps = num_ref_steps
         self.num_samples = len(self.new_target_df)
         self.id_to_ref_indices = self._create_id_to_ref_indices()
