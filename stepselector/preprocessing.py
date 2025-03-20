@@ -12,13 +12,138 @@ from osgeo import gdal
 import datetime
 from pathlib import Path
 
-def extract_observed_steps(step_length, raw_tracks_directory, save_directory, rasters_directory, ob_metadata_file = None, obs_to_process = None):
+def densely_interpolate(x, y, tolerance):
+    """
+    Linearly interpolate points between given trajectory points.
+
+    Parameters:
+    ----------
+    x, y : list or ndarray
+        Coordinates of the trajectory points.
+    tolerance : float
+        Maximum allowed distance between interpolated points.
+
+    Returns:
+    -------
+    tuple
+        Densely interpolated x and y coordinates.
+    """
+    n = len(x)
+    counts = np.zeros(n-1, dtype=np.int64)
+
+    # First pass: count total points
+    total_points = 0
+    for i in range(n-1):
+        if (np.isnan(x[i]) or np.isnan(x[i+1])):
+            total_points += 1
+            if i+1 == n-1:
+                total_points += 1
+            continue
+        else:
+            #print(i)
+            segment_length = np.sqrt((x[i+1] - x[i])**2 + (y[i+1] - y[i])**2)
+            #print('segment_length = ', str(segment_length))
+            num_points = max(int(segment_length / tolerance), 2)
+            #print('num_points = ', str(num_points))
+            counts[i] = num_points
+            total_points += num_points
+            # if i == 0:
+            #     total_points += num_points
+            # else:
+            #     total_points += (num_points - 1)
+        #print('total_points = ', total_points)
+    new_x = np.empty(total_points, dtype=np.float64)
+    new_y = np.empty(total_points, dtype=np.float64)
+    new_frames = np.empty(total_points, dtype=np.float64)
+
+    idx = 0
+    for i in range(n-1):
+        #print('idx = ', str(idx))
+        #print('i = ', str(i))
+        num_points = counts[i]
+        if np.isnan(x[i]) or np.isnan(x[i+1]):
+            new_x[idx] = np.nan
+            new_y[idx] = np.nan
+            new_frames[idx] = i
+            if i+1 == n-1:
+                new_x[idx+1] = np.nan
+                new_y[idx+1] = np.nan
+                new_frames[idx+1] = i+1
+            idx += 1
+        else:
+            seg_x = np.linspace(x[i], x[i+1], num_points)
+            seg_y = np.linspace(y[i], y[i+1], num_points)
+            seg_frames = np.linspace(i, i+1, num_points)
+            for j in range(num_points):
+                new_x[idx] = seg_x[j]
+                new_y[idx] = seg_y[j]
+                new_frames[idx] = seg_frames[j]
+                idx += 1
+            # if i == 0:
+            #     # Use all points for the first segment
+            #     for j in range(num_points):
+            #         new_x[idx] = seg_x[j]
+            #         new_y[idx] = seg_y[j]
+            #         new_frames[idx] = seg_frames[j]
+            #         idx += 1
+            # else:
+            #     # Skip the first point in subsequent segments to avoid duplication
+            #     for j in range(1, num_points):
+            #         new_x[idx] = seg_x[j]
+            #         new_y[idx] = seg_y[j]
+            #         new_frames[idx] = seg_frames[j]
+            #         idx += 1
+
+    return new_frames, new_x, new_y, 
+
+def interpolate_raw_tracks(raw_tracks_directory, save_directory, tolerance = 0.05, obs_to_process = None):
+    """
+    Densely interpolate raw tracks
+
+    Parameters:
+        - raw_tracks_directory: folder where raw trajectories are stored. Should be one .npy per observation.
+        - save_directory: where to save resulting dataframes.
+        - tolerance: the maximum distance between interpolated steps, in m. Default = 0.05 (5 cm).
+        - obs_to_process (OPTIONAL): If you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
+        
+    """
+    # Get list of observations to process
+    if obs_to_process is None:
+        raw_tracks_files = sorted(glob.glob(os.path.join(raw_tracks_directory, '*.npy')))
+        observations = []
+        for f in raw_tracks_files:
+            obs = f.split('/')[-1].split('_')[0]
+            observations = np.append(observations, obs)
+            observations = np.unique(observations)
+    else:
+        observations = obs_to_process
+
+    # For each observation...
+    for o in tqdm(observations):
+        raw_tracks = os.path.join(raw_tracks_directory, '%s_utm_tracks.npy' %o)
+        file = np.load(raw_tracks, allow_pickle = True)
+
+        # For each track...
+        for t, track in enumerate(file):
+            new_filename = str(raw_tracks.split('/')[-1].split('_')[0] + '_track' + '{:02}'.format(t) + '_dense.pkl')
+            obs = raw_tracks.split('/')[-1].split('_')[0]
+            new_file = os.path.join(save_directory, new_filename)
+            dense_track = densely_interpolate(x = track[:,0], y = track[:,1], tolerance = tolerance)
+            dense_data = pd.DataFrame({'frame': dense_track[0],
+                           'x': dense_track[1],
+                           'y': dense_track[2]
+                          })
+            dense_data.drop_duplicates(inplace = True, ignore_index = True)
+            dense_data.to_pickle(new_file)
+
+def extract_observed_steps(step_length, offsets, dense_tracks_directory, save_directory, rasters_directory, ob_metadata_file = None, obs_to_process = None):
     """
     Spatially discretizes observed trajectories
 
     Parameters:
         - step_length: the minimum step length (in meters)
-        - raw_tracks_directory: folder where trajectory data for each observation is stored. Should be one .npy per observation.
+        - offsets: the list of offset distances (in meters) from the initial trajectory location from which you want to rediscretize the track.
+        - dense_tracks_directory: folder where densely interpolated trajectory data for each observation is stored. Should be one .pkl per track.
         - save_directory: where to save the resulting dataframes.
         - rasters_directory: where the raster files are stored.
         - ob_metadata_file (OPTIONAL): .csv file containing metadata for each observation. If included, each step point will be checked to make sure it is within the map boundaries
@@ -27,9 +152,9 @@ def extract_observed_steps(step_length, raw_tracks_directory, save_directory, ra
 
     # Get list of observations to process
     if obs_to_process is None:
-        raw_tracks_files = sorted(glob.glob(os.path.join(raw_tracks_directory, '*.npy')))
+        dense_tracks_files = sorted(glob.glob(os.path.join(dense_tracks_directory, '*.pkl')))
         observations = []
-        for f in raw_tracks_files:
+        for f in dense_tracks_files:
             obs = f.split('/')[-1].split('_')[0]
             observations = np.append(observations, obs)
             observations = np.unique(observations)
@@ -52,68 +177,86 @@ def extract_observed_steps(step_length, raw_tracks_directory, save_directory, ra
             cellSizeY = DSM.transform[4]
 
         # Get tracks files to process
-        raw_tracks = os.path.join(raw_tracks_directory, '%s_utm_tracks.npy' %o)
-        file = np.load(raw_tracks, allow_pickle = True)
+        dense_track_files = sorted(glob.glob(os.path.join(dense_tracks_directory, '%s*.pkl' %o)))
+        for f in dense_track_files:
+            track = pd.read_pickle(f)
+            track_name = f.split('/')[-1].split('_')[1]
+            track_num = int(track_name.split('k')[-1])
+            #print('observation ', o, ', track ', str(track_num))
+            for y in offsets:
+                #print('offset = ', str(y))
+                new_filename = str(f.split('/')[-1].split('_')[0] + '_track' + '{:02}'.format(track_num) + '_%imsteps' %step_length + '_%imoffset.pkl' %y)
+                new_file = os.path.join(save_directory, new_filename)
+                steps=[]
+                rows=[]
+                frames = []
+                first_row = np.min(np.where(np.isfinite(track.x))[0])
+                ref_point = track.iloc[first_row][['x','y']].values
+                first_frame = track.iloc[first_row]['frame']
+                #print('first valid point is at row ', str(first_row), '. The location is ', str(ref_point))
 
-        for t, track in enumerate(file):
-            new_filename = str(raw_tracks.split('/')[-1].split('_')[0] + '_track' + '{:02}'.format(t) + '_%imsteps.pkl' %step_length)
-            obs = raw_tracks.split('/')[-1].split('_')[0]
-            new_file = os.path.join(save_directory, new_filename)
-            steps = []
-            frames = []
-            first_step = np.min(np.where(np.isfinite(track))[0])
-            ref_point = track[first_step]
-            steps.append(ref_point)
-            frames.append(first_step)
-            for n, i in enumerate(track):
-                if dist(i, ref_point) > step_length:
-                    if ob_metadata_file:
-                        col = int((i[0] - originX)/cellSizeX)
-                        row = int((i[1] - originY)/cellSizeY)
-                        DSM_val = dsm[row,col]
-                        if DSM_val == -10000:
-                            continue
-                        else:
-                            ref_point = i
-                            steps.append(ref_point)
-                            frames.append(n)
-                    else:
-                        ref_point = i
-                        steps.append(ref_point)
-                        frames.append(n)
-            lons = [i[0] for i in steps]
-            lats = [i[1] for i in steps]
-            ids = [str(obs + '_' + str(t) + '_f' + str(p) + '_ob') for p in frames]
-            new_df = pd.DataFrame(zip(frames, lats, lons, ids, ids), columns = ['frame', 'lat', 'lon', 'target_id', 'id'])
-            if len(new_df) >=5: # only keep tracks with at least 5 steps
-                new_df.to_pickle(new_file)
+                # get initial point given offset distance
+                #for n in np.arange(len(track.iloc[first_row-1:])):
+                #for n in np.arange(len(track.iloc[first_row:])):
+                if y>0:
+                    for n in np.arange(len(track)):
+                        if n > first_row:
+                            # print('initial n value is ', str(n))
+                            # n = n + first_row
+                            # print('adjusted n value is ', str(n))
+                            point = track.iloc[n][['x','y']].values
+                            #print('comparison point is ', str(point))
+                            if dist(point, ref_point) >= y:
+                                #print(str(dist(point, ref_point)))
+                                ref_point = point
+                                frame = track.iloc[n]['frame']
+                                #print('new first point is ', str(ref_point), ' at frame ', str(frame), ' at row ', str(n))
+                                first_row = n
+                                steps.append(ref_point)
+                                rows.append(first_row)
+                                frames.append(frame)
+                                break
+                else:
+                    steps.append(ref_point)
+                    rows.append(first_row)
+                    frames.append(first_frame)
+
+                # start at initial point and take points every n meters where n = step_length
+                for n in np.arange(len(track)):
+                    if n > first_row:
+                        point = track.iloc[n][['x','y']].values
+                        if dist(point, ref_point) >= step_length:
+                            if ob_metadata_file:
+                                col = int((point[0] - originX)/cellSizeX)
+                                row = int((point[1] - originY)/cellSizeY)
+                                DSM_val = dsm[row,col]
+                                if DSM_val == -10000:
+                                    continue
+                                else:
+                                    ref_point = point
+                                    steps.append(ref_point)
+                                    row = n
+                                    rows.append(row)
+                                    frame = track.iloc[n]['frame']
+                                    frames.append(frame)
+                            else:
+                                ref_point = point
+                                steps.append(ref_point)
+                                row = n
+                                rows.append(row)
+                                frame = track.iloc[n]['frame']
+                                frames.append(frame)
+                #print(frames)
+                lons = [i[0] for i in steps]
+                lats = [i[1] for i in steps]
+                #frames = [track.iloc[i]['frame'] for i in rows]
+                ids = [str(o + '_' + str(track_num) + '_f' + str(p) + '_ob') for p in frames]
+                new_df = pd.DataFrame(zip(frames, lats, lons, ids, ids), columns = ['frame', 'lat', 'lon', 'target_id', 'id'])
+                if len(new_df) >=5: # only keep tracks with at least 5 steps
+                    new_df.to_pickle(new_file)
         if ob_metadata_file:
             DSM.close()
 
-
-    
-    # for f in tqdm(raw_tracks_files):
-    #     file = np.load(f, allow_pickle = True)
-    #     for t, track in enumerate(file):
-    #         new_filename = str(f.split('/')[-1].split('_')[0] + '_track' + '{:02}'.format(t) + '_%imsteps.pkl' %step_length)
-    #         obs = f.split('/')[-1].split('_')[0]
-    #         new_file = os.path.join(save_directory, new_filename)
-    #         steps = []
-    #         frames = []
-    #         first_step = np.min(np.where(np.isfinite(track))[0])
-    #         ref_point = track[first_step]
-    #         steps.append(ref_point)
-    #         frames.append(first_step)
-    #         for n, i in enumerate(track):
-    #             if dist(i, ref_point) > step_length:
-    #                 ref_point = i
-    #                 steps.append(ref_point)
-    #                 frames.append(n)
-    #         lons = [i[0] for i in steps]
-    #         lats = [i[1] for i in steps]
-    #         ids = [str(obs + '_' + str(t) + '_f' + str(p) + '_ob') for p in frames]
-    #         new_df = pd.DataFrame(zip(frames, lats, lons, ids, ids), columns = ['frame', 'lat', 'lon', 'target_id', 'id'])
-    #         new_df.to_pickle(new_file)
 
 def calculate_full_angles(points): # from ChatGPT
     """
@@ -452,7 +595,8 @@ def get_observer_and_step_info(observed_steps_directory, simulated_steps_directo
                                 data.loc[index, 'step_speed_mps'] = step_speed_mps
 
                         if step_type == 'simulated':
-                            ref_steps_file = '%s_track%s*.pkl' %(o, "{:02d}".format(tracknum))
+                            offset = f.split('/')[-1].split('_')[-2]
+                            ref_steps_file = '%s_track%s*%s.pkl' %(o, "{:02d}".format(tracknum), offset)
                             ref_steps_path = glob.glob(os.path.join(observed_steps_directory, ref_steps_file))[0]
                             ref_steps = pd.read_pickle(ref_steps_path)
                             ref_times = np.sort(ref_steps.frame.unique())
@@ -485,9 +629,8 @@ def get_observer_and_step_info(observed_steps_directory, simulated_steps_directo
                             data.loc[index, 'step_duration_s'] = step_duration_s
                             data.loc[index, 'step_speed_mps'] = step_speed_mps
 
-            # data = data[['frame', 'lat', 'lon', 'id', 'target_id', 'angle_to_observers', 'dist_to_observer', 'delta_observer_dist', 'prev_step', 
-            #             'step_length_m', 'step_duration_s', 'step_speed_mps']]
-            data.drop(['observers_lat', 'observers_lon'], axis=1, inplace=True)
+            data = data[['frame', 'lat', 'lon', 'id', 'target_id', 'angle_to_observers', 'dist_to_observer', 'delta_observer_dist', 'prev_step', 'step_length_m', 'step_duration_s', 'step_speed_mps']]
+            #data.drop(['observers_lat', 'observers_lon'], axis=1, inplace=True)
             data.to_pickle(f)
 
 # def get_observer_and_step_info(observed_steps_directory, simulated_steps_directory, ob_metadata_file, obs_to_process = None):
@@ -766,7 +909,8 @@ def step_slope(observed_steps_directory, simulated_steps_directory, rasters_dire
             times = np.sort(steps.frame.unique())
             steps['ground_slope'] = np.nan
             if step_type == 'simulated':    
-                ref_steps_file = '%s_track%s*.pkl' %(o, "{:02d}".format(tracknum))
+                offset = f.split('/')[-1].split('_')[-2]
+                ref_steps_file = '%s_track%s*%s.pkl' %(o, "{:02d}".format(tracknum), offset)
                 ref_steps_path = glob.glob(os.path.join(observed_steps_directory, ref_steps_file))[0]
                 ref_steps = pd.read_pickle(ref_steps_path)
                 times = np.sort(ref_steps.frame.unique())
@@ -905,6 +1049,7 @@ def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tra
                 neighbor_distances = []
                 neighbor_visibilities = []
                 focal_height = steps.loc[n, 'observer_height']
+                rounded_frame = round(p)
 
                 # calculate focal animal's altitude in DSM units
                 dsm_col_focal = int((focal_point[0] - dsmX)/dsmcellSizeX)
@@ -918,7 +1063,7 @@ def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tra
                     else:
                         neighbor_id = track_metadata[(track_metadata['observation']==full_ob_name) & (track_metadata['track'] == t)]['individual_ID'].item() #look this up from track metadata based on track number
                         neighbor_spp = track_metadata[(track_metadata['observation']==full_ob_name) & (track_metadata['track'] == t)]['species'].item()
-                        neighbor_point = raw_tracks[t][p]
+                        neighbor_point = raw_tracks[t][rounded_frame]
         
                         if not np.isnan(neighbor_point).any():  
                             neighbor_dist = math.dist([neighbor_point[0], neighbor_point[1]], [focal_point[0], focal_point[1]])
@@ -987,7 +1132,7 @@ def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tra
 
 def get_ground_cover(observed_steps_directory, simulated_steps_directory, rasters_directory, obs_to_process = None):
     """
-    Sample a pre-generated groundcover raster to determine whether the location is on bare ground, grass, or under a tree.
+    Sample a pre-generated groundcover raster to determine whether the location is on a road, bare ground, grass, or under a tree.
 
     Parameters:
         - observed_steps_directory: folder where the observed steps .pkl files are stored. Should be one .pkl per track.
@@ -1162,10 +1307,14 @@ def preprocess_viewsheds(observed_steps_directory, simulated_steps_directory, vi
                     folder = os.path.join(viewshed_save_directory, full_ob_name, track)
                     Path(folder).mkdir(parents=True, exist_ok=True)
                     targetRasterName = os.path.join(folder, filename)
+                    if os.path.exists(targetRasterName):
+                        #print(filename, 'exists. Will not regenerate.')
+                        continue
+                    else:
+                        generate_viewshed(dsm_file, Xs[i], Ys[i], height[i], targetRasterName, radius, threads)
                 else:
                     targetRasterName = os.path.join(viewshed_save_directory, 'temp_raster.tif')
-    
-                generate_viewshed(dsm_file, Xs[i], Ys[i], height[i], targetRasterName, radius, threads)
+                    generate_viewshed(dsm_file, Xs[i], Ys[i], height[i], targetRasterName, radius, threads)
     
             end_time = datetime.datetime.now()
             #print('finished ' + f + ': ', end_time)
@@ -1216,6 +1365,39 @@ def viewshed_visibility(observed_steps_directory, simulated_steps_directory, vie
             steps['viewshed_vis'] = visibilities
 
             steps.to_pickle(f)
+
+def get_offset(observed_steps_directory, simulated_steps_directory, obs_to_process = None):
+    ''' Add an offset column to each file
+    '''
+    # Define observations to be processed
+    if obs_to_process is None:
+        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '*.pkl')))
+        observations = []
+        for f in observed_step_files:
+            obs = f.split('/')[-1].split('_')[0]
+            observations = np.append(observations, obs)
+            observations = np.unique(observations)
+    else:
+        observations = obs_to_process
+
+        
+    for o in tqdm(observations):
+        # get step files
+        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '%s*.pkl' %o)))
+        simulated_step_files = sorted(glob.glob(os.path.join(simulated_steps_directory, '%s*.pkl' %o)))
+
+        for f in observed_step_files:
+            track = pd.read_pickle(f)
+            offset = f.split('/')[-1].split('_')[-1].split('.')[0]
+            track['offset'] = offset
+            track.to_pickle(f)
+
+        for f in simulated_step_files:
+            track = pd.read_pickle(f)
+            offset = f.split('/')[-1].split('_')[-2]
+            track['offset'] = offset
+            track.to_pickle(f)
+
 
 ### I don't think the things below this line are used in the pipeline:
 def calculate_initial_compass_bearing(pointA, pointB): # adjusted from source: https://gist.github.com/jeromer/2005586
