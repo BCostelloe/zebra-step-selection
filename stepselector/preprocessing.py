@@ -1388,13 +1388,13 @@ def get_offset(observed_steps_directory, simulated_steps_directory, obs_to_proce
 
         for f in observed_step_files:
             track = pd.read_pickle(f)
-            offset = f.split('/')[-1].split('_')[-1].split('.')[0]
+            offset = f.split('/')[-1].split('_')[-1].split('moff')[0]
             track['offset'] = offset
             track.to_pickle(f)
 
         for f in simulated_step_files:
             track = pd.read_pickle(f)
-            offset = f.split('/')[-1].split('_')[-2]
+            offset = f.split('/')[-1].split('_')[-2].split('moff')[0]
             track['offset'] = offset
             track.to_pickle(f)
 
