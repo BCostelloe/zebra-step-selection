@@ -9,7 +9,9 @@ from joblib import delayed, Parallel
 import torch
 import tqdm
 
+
 class ZebraDataset(Dataset):
+    # Updated default feature lists: removed "road" and added "offset" and "nearest_neighbor_distance"
     DEFAULT_CONTEXT_FEATURES = [
         "target_id",
         "observation",
@@ -17,10 +19,7 @@ class ZebraDataset(Dataset):
         "angle_to_observers",
         "dist_to_observer",
         "delta_observer_dist",
-        "road",
-        "ground_class",
-        "ground_bare",
-        "ground_tree",
+        "ground_class",  # will be one-hot encoded into ground_class_bare, etc.
         "ground_slope",
         "viewshed_vis",
         "social_dens",
@@ -28,6 +27,8 @@ class ZebraDataset(Dataset):
         "age_class",
         "species",
         "individual_ID",
+        "offset",  # assumed to be an integer already
+        "nearest_neighbor_distance",  # computed from neighbor_distances
     ]
     DEFAULT_TARGET_FEATURES = [
         "target_id",
@@ -36,9 +37,7 @@ class ZebraDataset(Dataset):
         "angle_to_observers",
         "dist_to_observer",
         "delta_observer_dist",
-        "road",
-        "ground_bare",
-        "ground_tree",
+        "ground_class",  # will be one-hot encoded
         "ground_slope",
         "viewshed_vis",
         "social_dens",
@@ -46,6 +45,8 @@ class ZebraDataset(Dataset):
         "age_class",
         "species",
         "individual_ID",
+        "offset",  # assumed to be an integer already
+        "nearest_neighbor_distance",  # computed from neighbor_distances
     ]
 
     def __init__(
@@ -90,6 +91,16 @@ class ZebraDataset(Dataset):
             ignore_index=True,
         )
 
+        # --- Update new columns: compute nearest neighbor distance ---
+        for df in [target_df, reference_df]:
+            # "offset" is assumed to be an integer from preprocessing.
+            if "neighbor_distances" in df.columns:
+                df["nearest_neighbor_distance"] = df["neighbor_distances"].apply(
+                    lambda x: min(x)
+                    if isinstance(x, (list, np.ndarray)) and len(x) > 0
+                    else np.nan
+                )
+
         # Warn and drop NaNs if any
         if target_df.isnull().values.any():
             warnings.warn(
@@ -105,17 +116,18 @@ class ZebraDataset(Dataset):
         reference_df.dropna(inplace=True)
 
         # --- One-hot encoding ---
-        # ground_class
+        # ground_class: now values 0 = unclassified, 1 = bare, 2 = grass, 3 = tree, 4 = road
         onehot_ground = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
         ground_combined = pd.concat(
             [target_df[["ground_class"]], reference_df[["ground_class"]]]
         )
         onehot_ground.fit(ground_combined)
         new_ground_features = [
-            "ground_class_unclassified",
-            "ground_class_bare",
-            "ground_class_grass",
-            "ground_class_tree",
+            "ground_unclassified",
+            "ground_bare",
+            "ground_grass",
+            "ground_tree",
+            "ground_road",
         ]
         for df in [target_df, reference_df]:
             onehot = onehot_ground.transform(df[["ground_class"]])
@@ -152,8 +164,15 @@ class ZebraDataset(Dataset):
             self._update_features("age_class", new_age_features)
 
         # --- Transformations ---
+        # Added "nearest_neighbor_distance" to both log and zscore transformations
         transformations = {
-            "log": ["step_speed_mps", "dist_to_observer", "social_dens", "social_vis"],
+            "log": [
+                "step_speed_mps",
+                "dist_to_observer",
+                "social_dens",
+                "social_vis",
+                "nearest_neighbor_distance",
+            ],
             "angle": ["angle_to_observers"],
             "zscore": [
                 "step_speed_mps",
@@ -164,6 +183,7 @@ class ZebraDataset(Dataset):
                 "viewshed_vis",
                 "social_dens",
                 "social_vis",
+                "nearest_neighbor_distance",
             ],
         }
         for df in [target_df, reference_df]:
@@ -217,7 +237,6 @@ class ZebraDataset(Dataset):
         # For each track, store a sorted list of (local_index, global index)
         self.track_to_context = {}
         for track, group in target_df.groupby("track_id"):
-            # Group should already be in order.
             self.track_to_context[track] = list(
                 zip(group["local_index"].values, group.index.values)
             )
@@ -321,7 +340,6 @@ class ZebraDataset(Dataset):
             if context_rows.empty:
                 context_rows = pad_df
             else:
-                # Ensure we only take the numeric columns before concatenation.
                 context_rows = pd.concat(
                     [context_rows[selected_context_features], pad_df],
                     ignore_index=True,
@@ -331,45 +349,61 @@ class ZebraDataset(Dataset):
 
         if self.return_dataframe:
             return (
+                context_rows,
                 target_row[selected_target_features],
                 ref_rows[selected_target_features],
-                context_rows,
                 target_row[selected_random_effects]
                 if selected_random_effects
                 else None,
             )
         else:
             return (
-                target_row[selected_target_features].to_numpy(dtype=np.float32)[None],
-                ref_rows[selected_target_features].to_numpy(dtype=np.float32)[:, None],
                 context_rows.to_numpy(dtype=np.float32),
+                target_row[selected_target_features].to_numpy(dtype=np.float32),
+                ref_rows[selected_target_features].to_numpy(dtype=np.float32),
                 target_row[selected_random_effects].to_numpy(dtype=np.float32)[None]
                 if selected_random_effects
                 else None,
             )
 
 
-def cache_dataset(original_dataloader, num_cache_passes=2):
+def cache_dataset(
+    original_dataloader, num_cache_passes=1, include_random_effects=False
+):
     """
     Iterates through the original_dataloader multiple times, caching the batches.
-    Assumes each batch is a tuple: (target, reference, context, random_effects).
+    Assumes each batch is a tuple: (context, target, reference, [random_effects]).
     Returns a TensorDataset containing the cached data.
+
+    Parameters:
+        original_dataloader: The input DataLoader yielding batches.
+        num_cache_passes: How many passes to make over the data (e.g., for shuffling).
+        include_random_effects: Whether to include random effects in the cached dataset.
     """
-    all_target, all_reference, all_context, all_random_effects = [], [], [], []
+    all_context, all_target, all_reference = [], [], []
+    if include_random_effects:
+        all_random_effects = []
+
     for _ in range(num_cache_passes):
         for batch in tqdm(original_dataloader, desc="Caching dataset"):
-            target, reference, context, random_effects = batch
+            context, target, reference, random_effects = batch
+            if include_random_effects:
+                all_random_effects.append(random_effects)
+            all_context.append(context)
             all_target.append(target)
             all_reference.append(reference)
-            all_context.append(context)
-            all_random_effects.append(random_effects)
+
+    cached_context = torch.cat(all_context, dim=0)
     cached_target = torch.cat(all_target, dim=0)
     cached_reference = torch.cat(all_reference, dim=0)
-    cached_context = torch.cat(all_context, dim=0)
-    cached_random_effects = torch.cat(all_random_effects, dim=0)
-    return TensorDataset(
-        cached_target, cached_reference, cached_context, cached_random_effects
-    )
+
+    if include_random_effects:
+        cached_random_effects = torch.cat(all_random_effects, dim=0)
+        return TensorDataset(
+            cached_context, cached_target, cached_reference, cached_random_effects
+        )
+    else:
+        return TensorDataset(cached_context, cached_target, cached_reference)
 
 
 def to_dataframe(data):
