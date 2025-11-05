@@ -11,6 +11,11 @@ import utm
 from osgeo import gdal
 import datetime
 from pathlib import Path
+import random
+
+# -----
+# Step 1: Densely interpolate raw tracks
+# -----
 
 def densely_interpolate(x, y, tolerance):
     """
@@ -40,26 +45,17 @@ def densely_interpolate(x, y, tolerance):
                 total_points += 1
             continue
         else:
-            #print(i)
             segment_length = np.sqrt((x[i+1] - x[i])**2 + (y[i+1] - y[i])**2)
-            #print('segment_length = ', str(segment_length))
             num_points = max(int(segment_length / tolerance), 2)
-            #print('num_points = ', str(num_points))
             counts[i] = num_points
             total_points += num_points
-            # if i == 0:
-            #     total_points += num_points
-            # else:
-            #     total_points += (num_points - 1)
-        #print('total_points = ', total_points)
+            
     new_x = np.empty(total_points, dtype=np.float64)
     new_y = np.empty(total_points, dtype=np.float64)
     new_frames = np.empty(total_points, dtype=np.float64)
 
     idx = 0
     for i in range(n-1):
-        #print('idx = ', str(idx))
-        #print('i = ', str(i))
         num_points = counts[i]
         if np.isnan(x[i]) or np.isnan(x[i+1]):
             new_x[idx] = np.nan
@@ -79,22 +75,10 @@ def densely_interpolate(x, y, tolerance):
                 new_y[idx] = seg_y[j]
                 new_frames[idx] = seg_frames[j]
                 idx += 1
-            # if i == 0:
-            #     # Use all points for the first segment
-            #     for j in range(num_points):
-            #         new_x[idx] = seg_x[j]
-            #         new_y[idx] = seg_y[j]
-            #         new_frames[idx] = seg_frames[j]
-            #         idx += 1
-            # else:
-            #     # Skip the first point in subsequent segments to avoid duplication
-            #     for j in range(1, num_points):
-            #         new_x[idx] = seg_x[j]
-            #         new_y[idx] = seg_y[j]
-            #         new_frames[idx] = seg_frames[j]
-            #         idx += 1
 
     return new_frames, new_x, new_y, 
+
+
 
 def interpolate_raw_tracks(raw_tracks_directory, save_directory, tolerance = 0.05, obs_to_process = None):
     """
@@ -135,6 +119,11 @@ def interpolate_raw_tracks(raw_tracks_directory, save_directory, tolerance = 0.0
                           })
             dense_data.drop_duplicates(inplace = True, ignore_index = True)
             dense_data.to_pickle(new_file)
+
+
+# -----
+# Step 2: extract observed steps
+# -----
 
 def extract_observed_steps(step_length, offsets, dense_tracks_directory, save_directory, rasters_directory, ob_metadata_file = None, obs_to_process = None):
     """
@@ -182,9 +171,7 @@ def extract_observed_steps(step_length, offsets, dense_tracks_directory, save_di
             track = pd.read_pickle(f)
             track_name = f.split('/')[-1].split('_')[1]
             track_num = int(track_name.split('k')[-1])
-            #print('observation ', o, ', track ', str(track_num))
             for y in offsets:
-                #print('offset = ', str(y))
                 new_filename = str(f.split('/')[-1].split('_')[0] + '_track' + '{:02}'.format(track_num) + '_%imsteps' %step_length + '_%imoffset.pkl' %y)
                 new_file = os.path.join(save_directory, new_filename)
                 steps=[]
@@ -193,11 +180,8 @@ def extract_observed_steps(step_length, offsets, dense_tracks_directory, save_di
                 first_row = np.min(np.where(np.isfinite(track.x))[0])
                 ref_point = track.iloc[first_row][['x','y']].values
                 first_frame = track.iloc[first_row]['frame']
-                #print('first valid point is at row ', str(first_row), '. The location is ', str(ref_point))
 
                 # get initial point given offset distance
-                #for n in np.arange(len(track.iloc[first_row-1:])):
-                #for n in np.arange(len(track.iloc[first_row:])):
                 if y>0:
                     for n in np.arange(len(track)):
                         if n > first_row:
@@ -226,9 +210,19 @@ def extract_observed_steps(step_length, offsets, dense_tracks_directory, save_di
                     if n > first_row:
                         point = track.iloc[n][['x','y']].values
                         if dist(point, ref_point) >= step_length:
+                            #print('point_x = ', str(point[0]))
+                            #print('point_y = ', str(point[1]))
                             if ob_metadata_file:
                                 col = int((point[0] - originX)/cellSizeX)
+                                # print('col = int((point[0] - originX)/cellSizeX)')
+                                # print('col = ', str(col))
+                                # print('originX = ', str(originX))
+                                # print('cellSizeX = ', str(cellSizeX))
                                 row = int((point[1] - originY)/cellSizeY)
+                                # print('row = int((point[1] - originY)/cellSizeY)')
+                                # print('row = ', str(row))
+                                # print('originY = ', str(originY))
+                                # print('cellSizeY = ', str(cellSizeY))
                                 DSM_val = dsm[row,col]
                                 if DSM_val == -10000:
                                     continue
@@ -257,6 +251,9 @@ def extract_observed_steps(step_length, offsets, dense_tracks_directory, save_di
         if ob_metadata_file:
             DSM.close()
 
+# -----
+# Step 3: Simulate reference steps
+# -----
 
 def calculate_full_angles(points): # from ChatGPT
     """
@@ -306,7 +303,7 @@ def calculate_full_angles(points): # from ChatGPT
 
 # This is adapted from ChatGPT.
 
-def calculate_multiple_simulated_points(points, data_frame, raster_band, num_simulated_points, originX, originY, cellSizeX, cellSizeY):
+def calculate_multiple_simulated_points(points, data_frame, raster_band, num_simulated_points, originX, originY, cellSizeX, cellSizeY, sample_dist):
     """
     Calculate multiple new points from given points, with specified numbers of simulated points.
     Random distances and angles are drawn from the provided DataFrame.
@@ -318,6 +315,7 @@ def calculate_multiple_simulated_points(points, data_frame, raster_band, num_sim
     :param data_frame: DataFrame with columns 'angle' and 'distance' to draw random samples.
     :param num_simulated_points: Number of simulated points to generate per real point.
     :param raster_band: band from DSM raster
+    :param sample_dist: what distribution should the turning angles be drawn from? options are 'observed' or 'uniform'.
     
     :return: Dictionary with each real point as a key, and list of tuples (x, y) of simulated points.
     """
@@ -338,7 +336,10 @@ def calculate_multiple_simulated_points(points, data_frame, raster_band, num_sim
             # Draw random distance and angle
             sample = data_frame.sample(1).iloc[0]
             distance = sample['distance']
-            angle = sample['angle']
+            if sample_dist == 'observed':
+                angle = sample['angle']
+            if sample_dist == 'uniform':
+                angle = random.sample(range(0, 180),1)
             
             # Calculate the absolute angle for the new simulated point
             current_angle = vector_angle + angle
@@ -362,7 +363,7 @@ def calculate_multiple_simulated_points(points, data_frame, raster_band, num_sim
     
     return simulated_points
 
-def simulate_fake_steps(n_steps, observed_steps_directory, save_directory, rasters_directory, ob_metadata_file, obs_to_process = None):
+def simulate_fake_steps(n_steps, observed_steps_directory, save_directory, rasters_directory, ob_metadata_file, sample_dist, obs_to_process = None):
     """
     Generate some number of simulated alternative steps for each observed step.
     Simulated steps are defined by drawing randomly from the observed distributions of step lengths and turning angles.
@@ -432,7 +433,8 @@ def simulate_fake_steps(n_steps, observed_steps_directory, save_directory, raste
                                                                        originX = originX,
                                                                        originY = originY,
                                                                        cellSizeX = cellSizeX,
-                                                                       cellSizeY = cellSizeY)
+                                                                       cellSizeY = cellSizeY,
+                                                                       sample_dist = sample_dist)
                 
                 # combine everything into the same dataframe and save
                 times = []
@@ -448,6 +450,8 @@ def simulate_fake_steps(n_steps, observed_steps_directory, save_directory, raste
                         times.append(time)
             
                 new_df = pd.DataFrame(zip(times, lats, lons), columns = ['frame', 'lat', 'lon'])
+                new_df.lat = [x[0] for x in new_df.lat]
+                new_df.lon = [x[0] for x in new_df.lon]
                 new_df['step_type'] = 'simulated'
                 new_df['count'] = new_df.groupby('frame').cumcount()
                 new_df['id'] = [str(o + '_' + str(track_num) + '_f' + str(frame) + '_sim-' + str(count)) for frame, count in zip(new_df['frame'],new_df['count'])]
@@ -489,6 +493,10 @@ def ang(lineA, lineB):
         
         return ang_deg
 
+# -----
+# Step 4: Get observation team and step info
+# -----
+
 def get_observer_and_step_info(observed_steps_directory, simulated_steps_directory, ob_metadata_file, obs_to_process = None):
     """
     Generate some number of simulated alternative steps for each observed step.
@@ -521,22 +529,31 @@ def get_observer_and_step_info(observed_steps_directory, simulated_steps_directo
         observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '%s*.pkl' %o)))
         simulated_step_files = sorted(glob.glob(os.path.join(simulated_steps_directory, '%s*.pkl' %o)))
         step_files = observed_step_files + simulated_step_files
+        obnum = o.split('b')[-1]
+        obname = str('observation' + obnum)
+
+        # Get lat and lon of observer and convert to UTMs
+        ob_lat = meta[meta['observation'] == obname]['observer_lat'].iloc[0]
+        ob_lon = meta[meta['observation'] == obname]['observer_lon'].iloc[0]
+        oblon, oblat, N, L = utm.from_latlon(ob_lat, ob_lon)
 
         # process each observed step file
         for f in step_files:
             data = pd.read_pickle(f)
             data.reset_index(drop = True, inplace = True)
-            obnum = o.split('b')[-1]
-            obname = str('observation' + obnum)
             tracknum = int(f.split('/')[-1].split('_')[1].split('k')[-1])
             step_type = f.split('/')[-2]
+            
+            # get the offset
+            if step_type == 'observed':
+                offset = f.split('/')[-1].split('_')[-1].split('moff')[0]
+            if step_type == 'simulated':
+                offset = f.split('/')[-1].split('_')[-2].split('moff')[0]
+            data['offset'] = offset
 
-            # Get lat and lon of observer and convert to UTMs
-            ob_lat = meta[meta['observation'] == obname]['observer_lat'].iloc[0]
-            ob_lon = meta[meta['observation'] == obname]['observer_lon'].iloc[0]
-            oblon, oblat, N, L = utm.from_latlon(ob_lat, ob_lon)
-            data['observers_lat'] = oblat
-            data['observers_lon'] = oblon
+            # # add observer positions to dataframe
+            # data['observers_lat'] = oblat
+            # data['observers_lon'] = oblon
             
             # Calculate angle between step vector and vector to observation team
             ## First, get a list of all unique time values in order
@@ -629,129 +646,13 @@ def get_observer_and_step_info(observed_steps_directory, simulated_steps_directo
                             data.loc[index, 'step_duration_s'] = step_duration_s
                             data.loc[index, 'step_speed_mps'] = step_speed_mps
 
-            data = data[['frame', 'lat', 'lon', 'id', 'target_id', 'angle_to_observers', 'dist_to_observer', 'delta_observer_dist', 'prev_step', 'step_length_m', 'step_duration_s', 'step_speed_mps']]
+            data = data[['frame', 'lat', 'lon', 'id', 'target_id', 'offset', 'angle_to_observers', 'dist_to_observer', 'delta_observer_dist', 'prev_step', 'step_length_m', 'step_duration_s', 'step_speed_mps']]
             #data.drop(['observers_lat', 'observers_lon'], axis=1, inplace=True)
             data.to_pickle(f)
 
-# def get_observer_and_step_info(observed_steps_directory, simulated_steps_directory, ob_metadata_file, obs_to_process = None):
-#     """
-#     Generate some number of simulated alternative steps for each observed step.
-#     Simulated steps are defined by drawing randomly from the observed distributions of step lengths and turning angles.
-#     Each step is checked to ensure that it falls within the bounds of the associated DSM raster.
-
-#     Parameters:
-#         - observed_steps_directory: folder where the observed steps .pkl files are stored. Should be one .pkl per track.
-#         - simulated_steps_directory: folder where the simulated steps .pkl files are stored. Should be one .pkl per track.
-#         - ob_metadata_file: file giving the map area names that correspond to each observation
-#         - obs_to_process (OPTIONAL): if you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
-#     """
-#     # Load metadata file
-#     meta = pd.read_csv(ob_metadata_file)
-    
-#     # Define observations to be processed
-#     if obs_to_process is None:
-#         observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '*.pkl')))
-#         observations = []
-#         for f in observed_step_files:
-#             obs = f.split('/')[-1].split('_')[0]
-#             observations = np.append(observations, obs)
-#             #observations.append(obs)
-#             observations = np.unique(observations)
-#     else:
-#         observations = obs_to_process
-
-#     for o in tqdm(observations):
-#         # get observed step files to process
-#         observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '%s*.pkl' %o)))
-#         simulated_step_files = sorted(glob.glob(os.path.join(simulated_steps_directory, '%s*.pkl' %o)))
-#         step_files = observed_step_files + simulated_step_files
-
-#         # process each observed step file
-#         for f in step_files:
-#             data = pd.read_pickle(f)
-#             data.reset_index(drop = True, inplace = True)
-#             obnum = o.split('b')[-1]
-#             obname = str('observation' + obnum)
-#             tracknum = int(f.split('/')[-1].split('_')[1].split('k')[-1])
-#             step_type = f.split('/')[-2]
-
-#             # Get lat and lon of observer and convert to UTMs
-#             ob_lat = meta[meta['observation'] == obname]['observer_lat'].iloc[0]
-#             ob_lon = meta[meta['observation'] == obname]['observer_lon'].iloc[0]
-#             oblon, oblat, N, L = utm.from_latlon(ob_lat, ob_lon)
-#             data['observers_lat'] = oblat
-#             data['observers_lon'] = oblon
-            
-#             # Calculate angle between step vector and vector to observation team
-#             ## First, get a list of all unique time values in order
-#             times = np.sort(data.frame.unique())
-            
-#             ## create column to store result
-#             data['angle_to_observers'] = np.nan
-#             data['delta_observer_dist'] = np.nan
-#             data['dist_to_observer'] = np.nan
-#             data['prev_step'] = None
-#             data['step_length_m'] = np.nan
-#             data['step_duration_s'] = np.nan
-#             data['step_speed_mps'] = np.nan
-            
-#             for t in np.arange(len(times)):
-#                 for index, row in data.iterrows():
-#                     if row['frame'] == times[t]:
-        
-#                         # calculate distance to observer team
-#                         step_end_lat = row['lat']
-#                         step_end_lon = row['lon']
-#                         dist_end = dist((step_end_lon, step_end_lat), (oblon, oblat))
-#                         data.loc[index, 'dist_to_observer'] = dist_end
-        
-#                         # the following operations can't be done for the first location in observed step files since there was no previous location
-#                         if t > 0:
-
-#                             if step_type == 'observed':
-                        
-#                                 # define vectors representing current step and vector to observers
-#                                 start_lat = data[data['frame'] == times[t-1]]['lat'].iloc[0]
-#                                 start_lon = data[data['frame'] == times[t-1]]['lon'].iloc[0]
-#                                 start_step = data[data['frame'] == times[t-1]]['id'].iloc[0]
-
-#                             if step_type == 'simulated':
-#                                 ref_steps_file = '%s_track%s*.pkl' %(o, "{:02d}".format(tracknum))
-#                                 ref_steps_path = glob.glob(os.path.join(observed_steps_directory, ref_steps_file))[0]
-#                                 ref_steps = pd.read_pickle(ref_steps_path)
-#                                 start_lat = ref_steps[ref_steps['frame'] == times[t-1]]['lat'].iloc[0]
-#                                 start_lon = ref_steps[ref_steps['frame'] == times[t-1]]['lon'].iloc[0]
-#                                 start_step = ref_steps[ref_steps['frame'] == times[t-1]]['id'].iloc[0]
-
-#                             step_vect = ((start_lon,start_lat),(step_end_lon,step_end_lat))
-#                             ob_vect = ((start_lon,start_lat),(oblon,oblat))
-                            
-#                             angle = ang(step_vect, ob_vect)
-                            
-#                             data.loc[index, 'angle_to_observers'] = angle
-            
-#                             # Calculate change in distance to the observer team
-#                             dist_start = dist((start_lon, start_lat), (oblon, oblat))
-                            
-#                             delta_observer_distance = dist_end - dist_start
-#                             data.loc[index, 'delta_observer_dist'] = delta_observer_distance
-                            
-            
-#                             # While we're here, let's calculate the step length, time duration and speed
-#                             step_length_m = dist((start_lon, start_lat), (step_end_lon, step_end_lat))
-#                             start_frame = times[t-1]
-#                             step_duration_s = (times[t] - times[t-1])/30
-#                             step_speed_mps = step_length_m/step_duration_s
-            
-#                             data.loc[index, 'prev_step'] = start_step
-#                             data.loc[index, 'step_length_m'] = step_length_m
-#                             data.loc[index, 'step_duration_s'] = step_duration_s
-#                             data.loc[index, 'step_speed_mps'] = step_speed_mps
-
-#             data = data[['frame', 'lat', 'lon', 'id', 'target_id', 'angle_to_observers', 'dist_to_observer', 'delta_observer_dist', 'prev_step', 
-#                         'step_length_m', 'step_duration_s', 'step_speed_mps']]
-#             data.to_pickle(f)
-
+# -----
+# Step 5: Get zebra heights 
+# -----
 
 def calculate_zebra_heights(observed_steps_directory, simulated_steps_directory, rasters_directory, ob_metadata_file, obs_to_process = None):
     """
@@ -785,12 +686,17 @@ def calculate_zebra_heights(observed_steps_directory, simulated_steps_directory,
         full_ob_name = 'observation' + o.split('b')[-1]
         map_name = metadata[metadata['observation'] == full_ob_name]['big_map'].item()
         obheights_raster = os.path.join(rasters_directory, 'zebra_heights', '%s_ZebraHeights_1-5m.tif' %map_name)
+        #print(obheights_raster)
         obheights_raster = rio.open(obheights_raster)
         obheights = obheights_raster.read(1)
         originX = obheights_raster.bounds[0]
+       # print('OriginX = ', str(originX))
         originY = obheights_raster.bounds[3]
+        #print('OriginY = ', str(originY))
         cellSizeX = obheights_raster.transform[0]
+        #print('cellSizeX = ', str(cellSizeX))
         cellSizeY = obheights_raster.transform[4]
+       # print('cellSizeY = ', str(cellSizeY))
 
         # get step files
         observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '%s*.pkl' %o)))
@@ -799,6 +705,8 @@ def calculate_zebra_heights(observed_steps_directory, simulated_steps_directory,
 
         for f in step_files:
             steps = pd.read_pickle(f)
+            #print("cols = [int((x - originX)/cellSizeX) for x in steps['lon']]")
+            #print(str(steps['lon'][0]))
             cols = [int((x - originX)/cellSizeX) for x in steps['lon']]
             rows = [int((y - originY)/cellSizeY) for y in steps['lat']]
             steps['observer_height'] = [obheights[row,col] for row,col in zip(rows, cols)]
@@ -860,6 +768,11 @@ def road_or_no(observed_steps_directory, simulated_steps_directory, rasters_dire
 
             steps.to_pickle(f)
         #roads_raster.close()
+
+# -----
+# Step 6: Get step slope
+# -----
+
 
 def step_slope(observed_steps_directory, simulated_steps_directory, rasters_directory, ob_metadata_file, obs_to_process = None):
     """
@@ -970,6 +883,10 @@ def step_slope(observed_steps_directory, simulated_steps_directory, rasters_dire
             steps.to_pickle(f)
         dtm.close()
 
+# -----
+# Step 7: Get social information
+# -----
+
 def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tracks_directory, rasters_directory, social_radius, ob_metadata_file, track_metadata_file, obs_to_process = None):
     """
     Get information on the focal animal's relationship (distance, visibility) to other group mates at each step location
@@ -1015,6 +932,7 @@ def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tra
         originY = obheights_raster.bounds[3]
         cellSizeX = obheights_raster.transform[0]
         cellSizeY = obheights_raster.transform[4]
+        obheights_raster.close()
 
         # get DSM raster and info
         dsm_raster = os.path.join(rasters_directory, 'DSMs', '%s_dsm.tif' %map_name)
@@ -1129,7 +1047,10 @@ def get_social_info(observed_steps_directory, simulated_steps_directory, raw_tra
         obheights_raster.close()
         dataset = None
 
-
+# -----
+# Step 8: Get ground cover
+# -----
+    
 def get_ground_cover(observed_steps_directory, simulated_steps_directory, rasters_directory, obs_to_process = None):
     """
     Sample a pre-generated groundcover raster to determine whether the location is on a road, bare ground, grass, or under a tree.
@@ -1177,6 +1098,10 @@ def get_ground_cover(observed_steps_directory, simulated_steps_directory, raster
             steps['ground_class'] = steps['ground_class'].astype('int32')
             steps.to_pickle(f)
 
+# -----
+# Step 9: get track info
+# -----
+
 def get_track_info(observed_steps_directory, simulated_steps_directory, track_metadata_file, obs_to_process = None):
     """
     Get information on the focal animal
@@ -1223,6 +1148,9 @@ def get_track_info(observed_steps_directory, simulated_steps_directory, track_me
 
             steps.to_pickle(f)
 
+# -----
+# Step 10: generate viewsheds
+# -----
 
 def generate_viewshed(dsm_file, X, Y, height, targetRasterName, radius, threads):
     src_ds = gdal.Open(dsm_file)      
@@ -1247,6 +1175,33 @@ def generate_viewshed(dsm_file, X, Y, height, targetRasterName, radius, threads)
         maxDistance=radius
     )
     src_ds = None
+
+def generate_viewshed_in_memory(srcBand, X, Y, targetRasterName, height, radius, threads):
+    mem_driver = gdal.GetDriverByName('MEM')
+    #targetDS = mem_driver.Create('', srcBand.XSize, srcBand.YSize, 1, gdal.GDT_Byte)
+    #targetBand = targetDS.GetRasterBand(1)
+    c_options = []
+    
+    targetDS = gdal.ViewshedGenerate(
+        srcBand=srcBand,
+        driverName="MEM",
+        #targetBand=targetBand,
+        targetRasterName=targetRasterName,
+        #targetRasterName = targetDS,
+        creationOptions=c_options,
+        observerX=X,
+        observerY=Y,
+        observerHeight=height,
+        targetHeight=0,
+        visibleVal=1,
+        invisibleVal=0,
+        outOfRangeVal=-10000,
+        noDataVal=-10000,
+        dfCurvCoeff=0.85714,
+        mode=1,
+        maxDistance=radius
+    )
+    return targetDS
 
 def preprocess_viewsheds(observed_steps_directory, simulated_steps_directory, viewshed_save_directory, ob_metadata_file, radius, threads, map_directory, obs_to_process = None, keep_rasters = True):
     """
@@ -1282,6 +1237,8 @@ def preprocess_viewsheds(observed_steps_directory, simulated_steps_directory, vi
         
         # load dsm
         dsm_file = os.path.join(map_directory, map_name, '3_dsm_ortho', '1_dsm', '%s_dsm.tif' %map_name)
+        src_ds = gdal.Open(dsm_file)
+        srcBand = src_ds.GetRasterBand(1)
 
         # get step files
         observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '%s*.pkl' %o)))
@@ -1297,8 +1254,10 @@ def preprocess_viewsheds(observed_steps_directory, simulated_steps_directory, vi
             Xs = [x for x in steps['lon']]
             Ys = [y for y in steps['lat']]
             height = [h for h in steps['observer_height']]
-            src_ds = gdal.Open(dsm_file)
-            srcBand = src_ds.GetRasterBand(1)
+            #I moved the following two lines up out of this for loop
+            # src_ds = gdal.Open(dsm_file)
+            # srcBand = src_ds.GetRasterBand(1)
+
     
             args_list = []
             for i in range(len(Xs)):
@@ -1320,6 +1279,132 @@ def preprocess_viewsheds(observed_steps_directory, simulated_steps_directory, vi
             #print('finished ' + f + ': ', end_time)
             processing_time = end_time - start_time
             print(f.split('_steps/')[-1] + ' completed. File processing time: ', processing_time)
+
+def preprocess_viewsheds_vis(observed_steps_directory, simulated_steps_directory, viewshed_save_directory, dataset, ob_metadata_file, radius, threads, rasters_directory, obs_to_process = None, keep_rasters = True):
+    """
+    Generate and save a viewshed raster for each step location.
+
+    Parameters:
+        - observed_steps_directory: folder where the observed steps .pkl files are stored. Should be one .pkl per track.
+        - simulated_steps_directory: folder where the simulated steps .pkl files are stored. Should be one .pkl per track.
+        - viewshed_save_directory: where to save the generated viewsheds
+        - ob_metadata_file: file giving the map area names that correspond to each observation
+        - obs_to_process (OPTIONAL): if you don't want to process all trajectory data, give a list of observations, e.g. ['ob015', 'ob074']
+        - radius: radius of the viewshed circle, in meters
+        - threads: number of processors to use to calculate the viewsheds.
+    """
+    # Load metadata file
+    metadata = pd.read_csv(ob_metadata_file)
+
+    # Get list of observations to process
+    if obs_to_process is None:
+        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '*.pkl')))
+        observations = []
+        for f in observed_step_files:
+            obs = f.split('/')[-1].split('_')[0]
+            observations = np.append(observations, obs)
+            observations = np.unique(observations)
+    else:
+        observations = obs_to_process
+
+    for o in tqdm(observations):
+        # get map name
+        full_ob_name = 'observation' + o.split('b')[-1]
+        map_name = metadata[metadata['observation'] == full_ob_name]['big_map'].item()
+        
+        # load dsm
+        dsm_file = os.path.join(rasters_directory, 'DSMs', '%s_dsm.tif' %map_name)
+
+        # get step files
+        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '%s*.pkl' %o)))
+        simulated_step_files = sorted(glob.glob(os.path.join(simulated_steps_directory, '%s*.pkl' %o)))
+        step_files = observed_step_files + simulated_step_files
+        step_files = sorted(step_files)
+
+        src_ds = gdal.Open(dsm_file)
+        srcBand = src_ds.GetRasterBand(1)
+    
+        for f in step_files:
+            start_time = datetime.datetime.now()
+            #print('starting ' + f + ': ', start_time)
+            steps = pd.read_pickle(f)
+            track = f.split('/')[-1].split('_')[1]
+            # Xs = [x for x in steps['lon']]
+            # Ys = [y for y in steps['lat']]
+            # height = [h for h in steps['observer_height']]
+            step_type = f.split('/')[-2]
+            visibilities = []
+
+            for i, row in steps.iterrows():
+                X, Y, height = float(row['lon']), float(row['lat']), row['observer_height']
+
+                # Generate filename and check if raster already exists
+                filename = row['id'] + '_viewshed%sm.tif' %radius
+                if step_type == 'observed':
+                    folder = os.path.join(viewshed_save_directory, full_ob_name, track, 'observed')
+
+                if step_type == 'simulated':
+                    off = str(row['offset']) + 'm_offset'
+                    folder = os.path.join(viewshed_save_directory, full_ob_name, dataset, track, 'simulated', off)
+                
+                Path(folder).mkdir(parents=True, exist_ok=True)
+                targetRasterName = os.path.join(folder, filename)
+                
+                # If it exists, read it in and calculate the proportion visible
+                if os.path.exists(targetRasterName):
+                    vs = gdal.Open(targetRasterName)
+                    vshed = vs.GetRasterBand(1)
+                    visibility = vshed.GetStatistics(0,1)[2]
+                    visibilities.append(visibility)
+                    vs = None
+                    
+                # If it doesn't exist, create it in memory, calculate proportion visible,
+                # and if keep_rasters, save raster
+                else:
+                    # print('X is ' + str(X) + ' with datatype ' + str(type(X)))
+                    # print('Y is ' + str(Y) + ' with datatype ' + str(type(Y)))
+                    # print('height is ' + str(height) + ' with datatype ' + str(type(height)))
+
+                    # Generate viewshed in memory
+                    in_memory_raster = generate_viewshed_in_memory(srcBand, X, Y, targetRasterName, height, radius, threads)
+                    vshed_array = in_memory_raster.GetRasterBand(1)
+
+                    # calculate visibility
+                    visibility = vshed_array.GetStatistics(0,1)[2]
+                    visibilities.append(visibility)
+
+                    if keep_rasters:
+                        gtiff_driver = gdal.GetDriverByName('GTiff')#.CreateCopy(targetRasterName, in_memory_raster)
+                        gtiff_driver.CreateCopy(targetRasterName, in_memory_raster, options = ['NUM_THREADS=%i' %threads, 'COMPRESS=PACKBITS'])
+            steps['viewshed_vis'] = visibilities
+            steps.to_pickle(f)
+            end_time = datetime.datetime.now()
+            #print('finished ' + f + ': ', end_time)
+            processing_time = end_time - start_time
+            print(f.split('_steps/')[-1] + ' completed. File processing time: ', processing_time)
+
+        src_ds = None
+    
+            # args_list = []
+            # for i in range(len(Xs)):
+            #     if keep_rasters:
+            #         filename = steps.iloc[i]['id'] + '_viewshed%sm.tif' %radius
+            #         folder = os.path.join(viewshed_save_directory, full_ob_name, track)
+            #         Path(folder).mkdir(parents=True, exist_ok=True)
+            #         targetRasterName = os.path.join(folder, filename)
+            #         if os.path.exists(targetRasterName):
+            #             #print(filename, 'exists. Will not regenerate.')
+            #             continue
+            #         else:
+            #             generate_viewshed(dsm_file, Xs[i], Ys[i], height[i], targetRasterName, radius, threads)
+            #     else:
+            #         targetRasterName = os.path.join(viewshed_save_directory, 'temp_raster.tif')
+            #         generate_viewshed(dsm_file, Xs[i], Ys[i], height[i], targetRasterName, radius, threads)
+    
+            # end_time = datetime.datetime.now()
+            # #print('finished ' + f + ': ', end_time)
+            # processing_time = end_time - start_time
+            # print(f.split('_steps/')[-1] + ' completed. File processing time: ', processing_time)
 
 def viewshed_visibility(observed_steps_directory, simulated_steps_directory, viewshed_save_directory, obs_to_process = None):
     """
@@ -1366,37 +1451,65 @@ def viewshed_visibility(observed_steps_directory, simulated_steps_directory, vie
 
             steps.to_pickle(f)
 
-def get_offset(observed_steps_directory, simulated_steps_directory, obs_to_process = None):
-    ''' Add an offset column to each file
-    '''
-    # Define observations to be processed
-    if obs_to_process is None:
-        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '*.pkl')))
-        observations = []
-        for f in observed_step_files:
-            obs = f.split('/')[-1].split('_')[0]
-            observations = np.append(observations, obs)
-            observations = np.unique(observations)
-    else:
-        observations = obs_to_process
+# def get_offset(observed_steps_directory, simulated_steps_directory, obs_to_process = None):
+#     ''' Add an offset column to each file
+#     '''
+#     # Define observations to be processed
+#     if obs_to_process is None:
+#         observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '*.pkl')))
+#         observations = []
+#         for f in observed_step_files:
+#             obs = f.split('/')[-1].split('_')[0]
+#             observations = np.append(observations, obs)
+#             observations = np.unique(observations)
+#     else:
+#         observations = obs_to_process
 
         
-    for o in tqdm(observations):
-        # get step files
-        observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '%s*.pkl' %o)))
-        simulated_step_files = sorted(glob.glob(os.path.join(simulated_steps_directory, '%s*.pkl' %o)))
+#     for o in tqdm(observations):
+#         # get step files
+#         observed_step_files = sorted(glob.glob(os.path.join(observed_steps_directory, '%s*.pkl' %o)))
+#         simulated_step_files = sorted(glob.glob(os.path.join(simulated_steps_directory, '%s*.pkl' %o)))
 
-        for f in observed_step_files:
-            track = pd.read_pickle(f)
-            offset = f.split('/')[-1].split('_')[-1].split('moff')[0]
-            track['offset'] = offset
-            track.to_pickle(f)
+#         for f in observed_step_files:
+#             track = pd.read_pickle(f)
+#             offset = f.split('/')[-1].split('_')[-1].split('moff')[0]
+#             track['offset'] = offset
+#             track = track[['frame',
+#                            'lat',
+#                            'lon',
+#                            'id',
+#                            'target_id',
+#                            'angle_to_observers',
+#                            'dist_to_observer',
+#                            'delta_observer_dist',
+#                            'prev_step',
+#                            'step_length_m',
+#                            'step_duration_s',
+#                            'step_speed_mps',
+#                            'observer_height',
+#                            'road',
+#                            'ground_slope',
+#                            'neighbor_ids',
+#                            'neighbor_spps',
+#                            'neighbor_points',
+#                            'neighbor_distances',
+#                            'neighbor_visibility',
+#                            'social_dens',
+#                            'social_vis',
+#                            'ground_class',
+#                            'observation',
+#                            'individual_ID',
+#                            'species',
+#                            'age_class',
+#                            'viewshed_vis','offset']]
+#             track.to_pickle(f)
 
-        for f in simulated_step_files:
-            track = pd.read_pickle(f)
-            offset = f.split('/')[-1].split('_')[-2].split('moff')[0]
-            track['offset'] = offset
-            track.to_pickle(f)
+#         for f in simulated_step_files:
+#             track = pd.read_pickle(f)
+#             offset = f.split('/')[-1].split('_')[-2].split('moff')[0]
+#             track['offset'] = offset
+#             track.to_pickle(f)
 
 
 ### I don't think the things below this line are used in the pipeline:
