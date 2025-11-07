@@ -334,19 +334,26 @@ def _viewshed_filename(step_id: str, radius_m: float) -> str:
 def _viewshed_folder(
     viewshed_root: Path,
     observation_id: str,
-    track_label: str,
+    track_label: str,         # e.g., "track000"
     is_simulated: bool,
-    offset: float | None,
-    dataset_tag: str | None = None,
-):
+    *,
+    dataset_tag: str | None = None,   # e.g., "steps_5m"
+    offset: float | None = None       # for simulated only
+) -> Path:
+    """
+    Folder layout (requested):
+      - Observed:   <root>/<obs_id>/<trackNNN>/observed/
+      - Simulated:  <root>/<obs_id>/<dataset_tag>/<trackNNN>/simulated/offset_<Xm>/
+    """
     base = Path(viewshed_root) / observation_id
-    if is_simulated:
-        if dataset_tag:
-            base = base / dataset_tag
-        off_tag = f"offset_{_dist_tag(offset or 0.0)}"
-        return _ensure_dir(base / track_label / "simulated" / off_tag)
-    else:
+    if not is_simulated:
         return _ensure_dir(base / track_label / "observed")
+    else:
+        if dataset_tag is None:
+            dataset_tag = "steps_unknown"
+        off_tag = f"offset_{_dist_tag(offset or 0.0)}"
+        return _ensure_dir(base / dataset_tag / track_label / "simulated" / off_tag)
+
 
 def _dist_tag(x: float) -> str:
     """Format distances for folder names: 5.0 -> '5m', 2.5 -> '2p5m'."""
@@ -652,6 +659,85 @@ def summarize_viewshed_preview(df: pd.DataFrame) -> pd.DataFrame:
     return g
 
 
+def _viewshed_mean_visible_from_mem(mem_ds: "gdal.Dataset") -> float:
+    band = mem_ds.GetRasterBand(1)
+    stats = band.GetStatistics(0, 1)
+    if stats is not None:
+        return float(stats[2])
+    arr = band.ReadAsArray()
+    nodata = band.GetNoDataValue()
+    if nodata is not None:
+        arr = np.where(arr == nodata, np.nan, arr)
+    return float(np.nanmean(arr))
+
+def _viewshed_generate_mem_from_band(band: "gdal.Band", X: float, Y: float, observer_height: float, radius_m: float):
+    """
+    Generate a viewshed *in memory* using an already-open band (supports downsampled MEM DSM).
+    """
+    return gdal.ViewshedGenerate(
+        srcBand=band,
+        driverName="MEM",
+        targetRasterName="",
+        creationOptions=[],
+        observerX=float(X),
+        observerY=float(Y),
+        observerHeight=float(observer_height),
+        targetHeight=0.0,
+        visibleVal=1,
+        invisibleVal=0,
+        outOfRangeVal=-10000,
+        noDataVal=-10000,
+        dfCurvCoeff=0.85714,
+        mode=1,
+        maxDistance=float(radius_m),
+    )
+
+def _save_mem_to_gtiff(mem_ds: "gdal.Dataset", out_tif: Path, threads: int = 1):
+    out_tif.parent.mkdir(parents=True, exist_ok=True)
+    drv = gdal.GetDriverByName("GTiff")
+    drv.CreateCopy(str(out_tif), mem_ds, options=[f"NUM_THREADS={int(threads)}", "COMPRESS=PACKBITS"])
+
+def _build_downsampled_dsm_mem(src_path: Path, target_cell_size_m: float, resample_alg: str = "bilinear") -> "gdal.Dataset":
+    """
+    Downsample the DSM once per observation into a MEM dataset at target_cell_size_m.
+    If native resolution ~ target (within ~5%), returns the original file dataset.
+    Caller should keep the returned handle alive for the whole observation.
+    """
+    src = gdal.Open(str(src_path))
+    if src is None:
+        raise FileNotFoundError(f"Cannot open DSM: {src_path}")
+
+    gt = src.GetGeoTransform()
+    px = abs(gt[1]); py = abs(gt[5]) if gt[5] != 0 else px
+
+    # If within ~5%, reuse original
+    if (abs(px - target_cell_size_m)/px < 0.05) and (abs(py - target_cell_size_m)/py < 0.05):
+        return src  # keep original open
+
+    # Build WarpOptions with MEM format (this is the key change)
+    opts = gdal.WarpOptions(
+        format="MEM",
+        xRes=target_cell_size_m,
+        yRes=target_cell_size_m,
+        resampleAlg=resample_alg,   # e.g., "bilinear", "nearest", "average"
+        multithread=True,
+    )
+
+    # Create an in-memory (MEM) warped dataset
+    warped = gdal.Warp(
+        destNameOrDestDS="",        # empty string is fine when format='MEM' is set in options
+        srcDSOrSrcDSTab=src,
+        options=opts
+    )
+
+    # Release original; keep warped
+    src = None
+    if warped is None:
+        raise RuntimeError(
+            f"GDAL Warp failed for {src_path} at {target_cell_size_m} m (resample={resample_alg}). "
+            "Ensure the MEM driver is available in your GDAL build."
+        )
+    return warped
 
 
 # ----------
@@ -2155,27 +2241,32 @@ def annotate_viewsheds(
     radius: float = 30.0,
     threads: int = 8,
     dataset_tag: str | None = None,
+    # independent toggles:
     keep_observed: bool = True,
     keep_simulated: bool = False,
+    # reuse behavior:
     reuse_observed: bool = True,
     reuse_simulated: bool = False,
+    # progress:
     show_progress: bool = True,
     progress_mode: str = "observation",  # "observation" | "group" | "none"
+    # NEW: on-the-fly DSM downsampling
+    target_cell_size_m: float | None = None,     # e.g., 0.05 for 5 cm, 0.10 for 10 cm
+    resample_alg: str = "bilinear",              # "nearest","bilinear","cubic","average",...
 ):
     """
-    Step 10 (MEM-first): compute/read viewsheds and write `viewshed_vis`.
-
-    Fix: per-point track labeling to avoid 'track_unknown' and put files under the
-    correct <observation>/<track_label>/... folder.
+    Step 10 (optimized MEM-first): compute/read viewsheds and write `viewshed_vis`.
 
     - If a TIFF exists and reuse_* is True -> read mean from file, skip compute.
-    - Else compute once in memory; persist based on keep_observed/keep_simulated.
+    - Else compute once in memory; then persist based on keep_observed/keep_simulated.
+    - Downsample DSM (optional) once per observation into a MEM dataset for significant speedups.
+    - Per-track traversal (no 'track_unknown'); folders are observation/trackNNN/...
+    - Filenames use frame numbers; simulated also include replicate.
     """
-    def _dist_tag(x: float) -> str:
-        x = float(x)
-        return f"{int(x)}m" if x.is_integer() else f"{str(x).replace('.', 'p')}m"
-
-    auto_dataset_tag = dataset_tag or f"steps_{_dist_tag(step_length)}"
+    # dataset tag for simulated folders (e.g., "steps_5m")
+    def _dist_tag_local(x: float) -> str:
+        x = float(x);  return f"{int(x)}m" if x.is_integer() else f"{str(x).replace('.', 'p')}m"
+    auto_dataset_tag = dataset_tag or f"steps_{_dist_tag_local(step_length)}"
 
     zroot = Path(zarr_root)
     outroot = Path(viewshed_save_directory)
@@ -2191,7 +2282,7 @@ def annotate_viewsheds(
         obs_id = root.attrs.get("observation_id", store.stem)
         big_map = root.attrs.get("big_map", None)
 
-        # DSM path
+        # Resolve DSM path
         dsm_dir = Path(rasters_directory) / "DSMs"
         dsm_path = None
         if big_map and (dsm_dir / f"{big_map}_dsm.tif").exists():
@@ -2202,7 +2293,17 @@ def annotate_viewsheds(
             warnings.warn(f"{obs_id}: DSM not found; skipping.")
             continue
 
-        # Build tasks (collect arrays so we can size progress bars)
+        # Build per-observation DSM handle (optionally downsampled)
+        if target_cell_size_m is not None:
+            dsm_handle = _build_downsampled_dsm_mem(dsm_path, target_cell_size_m, resample_alg=resample_alg)
+        else:
+            dsm_handle = gdal.Open(str(dsm_path))
+            if dsm_handle is None:
+                warnings.warn(f"{obs_id}: could not open DSM; skipping.")
+                continue
+        dsm_band = dsm_handle.GetRasterBand(1)
+
+        # Build tasks list for progress sizing
         tasks = []
         for offset in offsets:
             for grp, is_sim in ((_group_observed(step_length, offset), False),
@@ -2214,81 +2315,31 @@ def annotate_viewsheds(
                 if ds is None or "position" not in ds or "observer_height" not in ds:
                     continue
 
-                # Core arrays
-                pos = ds["position"].values  # (point, 2)
+                pos = ds["position"].values              # (point,2)
+                frames = ds["frame"].values              # (point,)
                 xs = pos[:, 0].astype(float)
                 ys = pos[:, 1].astype(float)
                 heights = ds["observer_height"].values.astype(float)
-                npt = xs.size
 
-                # Ragged mapping: point -> track index
-                if ("track_start" not in ds) or ("track_count" not in ds):
-                    warnings.warn(f"{obs_id}/{grp}: missing track_start/track_count; using 'track_unknown'.")
-                    point_track = np.full(npt, -1, dtype=np.int32)
-                    track_labels = ["track_unknown"]
-                else:
-                    starts = ds["track_start"].values.astype(np.int64)
-                    counts = ds["track_count"].values.astype(np.int64)
-                    n_tracks = starts.size
+                # ragged by track
+                if ("track_start" not in ds) or ("track_count" not in ds) or ("track" not in ds.coords):
+                    warnings.warn(f"{obs_id}/{grp}: missing ragged track metadata; skipping group.")
+                    continue
+                starts = ds["track_start"].values.astype(np.int64)
+                counts = ds["track_count"].values.astype(np.int64)
+                n_tracks = ds.sizes["track"]
 
-                    # Build per-track label list
-                    track_labels = []
-                    if "track" in ds.coords and ds["track"].sizes.get("track", n_tracks) == n_tracks:
-                        # If user already stored track labels, use them — but strip observation prefix if present
-                        tvals = ds["track"].values
-                        for ti in range(n_tracks):
-                            raw = str(tvals[ti])
-                            # Normalize:
-                            #   - if already "track000", use as is
-                            #   - if something like "observation015_track000", strip the observation part
-                            m = re.search(r"(track\d+)", raw)
-                            if m:
-                                label = m.group(1)   # → track000
-                            else:
-                                label = f"track{ti:03d}"
-                            track_labels.append(label)
-                    else:
-                        # No track coord — fall back to simple track000, track001, ...
-                        track_labels = [f"track{ti:03d}" for ti in range(n_tracks)]
-
-                    # Vectorized-ish map: for each track block, assign its track index to its points
-                    point_track = np.full(npt, -1, dtype=np.int32)
-                    for ti in range(n_tracks):
-                        s = int(starts[ti]); c = int(counts[ti])
-                        if c > 0:
-                            point_track[s:s+c] = ti
-
-                # File IDs: prefer explicit 'id' var if present; else synthesize
-                if "id" in ds:
-                    ids = [str(i) for i in ds["id"].values]
-                else:
-                    # Use frame if available for determinism across discretizations; else fallback to pt index
-                    if "frame" in ds:
-                        frames = ds["frame"].values.astype(float)
-                        ids = []
-                        for i in range(npt):
-                            ti = int(point_track[i]) if point_track[i] >= 0 else 0
-                            label = track_labels[ti] if (0 <= ti < len(track_labels)) else "track_unknown"
-                            frame_i = int(round(frames[i])) if np.isfinite(frames[i]) else i
-                            ids.append(f"{obs_id}_{label}_frame{frame_i:06d}")
-                    else:
-                        ids = []
-                        for i in range(npt):
-                            ti = int(point_track[i]) if point_track[i] >= 0 else 0
-                            label = track_labels[ti] if (0 <= ti < len(track_labels)) else "track_unknown"
-                            ids.append(f"{obs_id}_{label}_pt{i:05d}")
+                # replicate only present for simulated
+                repl = ds["replicate"].values.astype(int) if (is_sim and "replicate" in ds) else None
 
                 tasks.append({
-                    "grp": grp,
-                    "is_sim": is_sim,
-                    "offset": offset,
-                    "xs": xs, "ys": ys, "heights": heights,
-                    "ids": ids,
-                    "point_track": point_track,   # <-- per-point track index
-                    "track_labels": track_labels, # <-- list of labels per track
+                    "grp": grp, "is_sim": is_sim, "offset": offset,
+                    "xs": xs, "ys": ys, "heights": heights, "frames": frames,
+                    "starts": starts, "counts": counts, "n_tracks": n_tracks,
+                    "replicate": repl,
                 })
 
-        # observation-level progress
+        # observation-level progress bar
         pbar_obs = None
         if progress_mode == "observation" and show_progress:
             total_pts = int(sum(t["xs"].size for t in tasks))
@@ -2297,17 +2348,12 @@ def annotate_viewsheds(
 
         # Process tasks
         for t in tasks:
-            grp       = t["grp"]
-            is_sim    = t["is_sim"]
-            offset    = t["offset"]
-            xs        = t["xs"]
-            ys        = t["ys"]
-            heights   = t["heights"]
-            ids       = t["ids"]
-            p2t       = t["point_track"]
-            tr_labels = t["track_labels"]
+            grp = t["grp"]; is_sim = t["is_sim"]; offset = t["offset"]
+            xs, ys, heights, frames = t["xs"], t["ys"], t["heights"], t["frames"]
+            starts, counts, n_tracks = t["starts"], t["counts"], t["n_tracks"]
+            replicate = t["replicate"]
 
-            # per-group progress
+            # per-group progress (optional)
             pbar_grp = None
             if progress_mode == "group" and show_progress:
                 pbar_grp = tqdm(total=int(xs.size), desc=f"{obs_id} | {grp}", unit="pts",
@@ -2315,64 +2361,328 @@ def annotate_viewsheds(
 
             vis = np.full(xs.shape[0], np.nan, dtype=np.float32)
 
-            for i in range(xs.shape[0]):
-                X, Y, hgt, step_id = float(xs[i]), float(ys[i]), float(heights[i]), ids[i]
+            # iterate per track to get stable track labels
+            for ti in range(n_tracks):
+                s = int(starts[ti]); c = int(counts[ti])
+                if c == 0:
+                    continue
+                track_label = f"track{ti:03d}"
 
-                ti = int(p2t[i]) if (i < p2t.size and p2t[i] >= 0) else -1
-                track_label = tr_labels[ti] if (0 <= ti < len(tr_labels)) else "track_unknown"
+                # point indices for this track block
+                idx_block = np.arange(s, s + c, dtype=np.int64)
 
-                folder = _viewshed_folder(
-                    outroot, obs_id,
-                    track_label=track_label,
-                    is_simulated=is_sim,
-                    offset=offset if is_sim else None,
-                    dataset_tag=(auto_dataset_tag if is_sim else None),
-                )
-                tif_path = folder / _viewshed_filename(step_id, radius)
+                # compute for each point
+                for p in idx_block:
+                    X, Y, hgt = float(xs[p]), float(ys[p]), float(heights[p])
+                    frame_num = int(round(float(frames[p])))
 
-                # reuse file if allowed and present
-                reuse = (reuse_simulated if is_sim else reuse_observed)
-                if reuse and tif_path.exists():
-                    try:
-                        vis[i] = _viewshed_mean_visible(tif_path)
-                    except Exception:
-                        pass  # fall back to compute in-memory
+                    # output file path
+                    folder = _viewshed_folder(
+                        viewshed_root=outroot,
+                        observation_id=obs_id,
+                        track_label=track_label,
+                        is_simulated=is_sim,
+                        dataset_tag=(auto_dataset_tag if is_sim else None),
+                        offset=(offset if is_sim else None),
+                    )
+                    if is_sim:
+                        rep = int(replicate[p]) if replicate is not None else 0
+                        fname = _viewshed_filename_sim(obs_id, track_label, frame_num, rep, radius)
+                    else:
+                        fname = _viewshed_filename_observed(obs_id, track_label, frame_num, radius)
+                    tif_path = folder / fname
 
-                # compute once in memory if needed
-                if np.isnan(vis[i]):
-                    try:
-                        mem_ds = _viewshed_generate_mem(dsm_path, X, Y, hgt, radius_m=radius)
+                    # reuse logic
+                    reuse = (reuse_simulated if is_sim else reuse_observed)
+                    if reuse and tif_path.exists():
                         try:
-                            band = mem_ds.GetRasterBand(1)
-                            stats = band.GetStatistics(0, 1)
-                            vis[i] = float(stats[2]) if stats is not None else np.nan
-                            # persist only if flagged for this class
-                            keep_flag = (keep_simulated if is_sim else keep_observed)
-                            if keep_flag:
+                            ds_tif = gdal.Open(str(tif_path))
+                            if ds_tif:
+                                band = ds_tif.GetRasterBand(1)
+                                stats = band.GetStatistics(0, 1)
+                                if stats is not None:
+                                    vis[p] = float(stats[2])
+                                else:
+                                    arr = band.ReadAsArray()
+                                    nod = band.GetNoDataValue()
+                                    if nod is not None:
+                                        arr = np.where(arr == nod, np.nan, arr)
+                                    vis[p] = float(np.nanmean(arr))
+                                ds_tif = None
+                                # progress & continue
+                                if pbar_obs is not None: pbar_obs.update(1)
+                                if pbar_grp is not None: pbar_grp.update(1)
+                                continue
+                        except Exception:
+                            # fall through to compute
+                            pass
+
+                    # compute in memory once
+                    try:
+                        mem_ds = _viewshed_generate_mem_from_band(dsm_band, X, Y, hgt, radius_m=radius)
+                        try:
+                            vis[p] = _viewshed_mean_visible_from_mem(mem_ds)
+                            # persist depending on class
+                            if (keep_simulated if is_sim else keep_observed):
                                 _save_mem_to_gtiff(mem_ds, tif_path, threads=threads)
                         finally:
                             mem_ds = None
                     except Exception as exc:
-                        warnings.warn(f"{obs_id} {grp} point {i}: viewshed error: {exc}")
-                        vis[i] = np.nan
+                        warnings.warn(f"{obs_id} {grp} track {ti} point {p}: viewshed error: {exc}")
+                        vis[p] = np.nan
 
-                if pbar_obs is not None:
-                    pbar_obs.update(1)
-                if pbar_grp is not None:
-                    pbar_grp.update(1)
+                    if pbar_obs is not None: pbar_obs.update(1)
+                    if pbar_grp is not None: pbar_grp.update(1)
 
             if pbar_grp is not None:
                 pbar_grp.close()
 
+            # write visibilities back to the group (single write)
             out = xr.Dataset({"viewshed_vis": (("point",), vis.astype(np.float32))})
             out["viewshed_vis"].attrs.update({
                 "description": f"Proportion visible in {int(radius)} m viewshed (1 visible, 0 invisible).",
                 "radius_m": float(radius),
-                "generator": "gdal.ViewshedGenerate (MEM path, optional GTiff persist)",
+                "generator": "gdal.ViewshedGenerate (MEM path, optional GTiff persist, optional downsampled DSM)",
                 "visibleVal": 1, "invisibleVal": 0, "nodataVal": -10000,
             })
             out.to_zarr(store, group=grp, mode="a")
 
         if pbar_obs is not None:
             pbar_obs.close()
+
+        # release per-observation DSM handle
+        dsm_band = None
+        dsm_handle = None
+
+# def annotate_viewsheds(
+#     step_length: float,
+#     offsets: list[float],
+#     rasters_directory: str | Path,
+#     viewshed_save_directory: str | Path,
+#     *,
+#     zarr_root: str | Path = "tracks_xarray",
+#     obs_to_process: str | list[str] | None = None,
+#     radius: float = 30.0,
+#     threads: int = 8,
+#     dataset_tag: str | None = None,
+#     keep_observed: bool = True,
+#     keep_simulated: bool = False,
+#     reuse_observed: bool = True,
+#     reuse_simulated: bool = False,
+#     show_progress: bool = True,
+#     progress_mode: str = "observation",  # "observation" | "group" | "none"
+# ):
+#     """
+#     Step 10 (MEM-first): compute/read viewsheds and write `viewshed_vis`.
+
+#     Fix: per-point track labeling to avoid 'track_unknown' and put files under the
+#     correct <observation>/<track_label>/... folder.
+
+#     - If a TIFF exists and reuse_* is True -> read mean from file, skip compute.
+#     - Else compute once in memory; persist based on keep_observed/keep_simulated.
+#     """
+#     def _dist_tag(x: float) -> str:
+#         x = float(x)
+#         return f"{int(x)}m" if x.is_integer() else f"{str(x).replace('.', 'p')}m"
+
+#     auto_dataset_tag = dataset_tag or f"steps_{_dist_tag(step_length)}"
+
+#     zroot = Path(zarr_root)
+#     outroot = Path(viewshed_save_directory)
+#     stores = _discover_stores(zroot, obs_to_process)
+#     if not stores:
+#         raise FileNotFoundError(f"No matching observation*.zarr in {zroot} (selection={obs_to_process})")
+
+#     obs_iter = tqdm(stores, desc="Step 10: observations", unit="obs", dynamic_ncols=True, leave=False) \
+#                if (show_progress and progress_mode != "none") else stores
+
+#     for store in obs_iter:
+#         root = xr.open_zarr(store)
+#         obs_id = root.attrs.get("observation_id", store.stem)
+#         big_map = root.attrs.get("big_map", None)
+
+#         # DSM path
+#         dsm_dir = Path(rasters_directory) / "DSMs"
+#         dsm_path = None
+#         if big_map and (dsm_dir / f"{big_map}_dsm.tif").exists():
+#             dsm_path = dsm_dir / f"{big_map}_dsm.tif"
+#         elif (dsm_dir / f"{obs_id}_dsm.tif").exists():
+#             dsm_path = dsm_dir / f"{obs_id}_dsm.tif"
+#         if dsm_path is None:
+#             warnings.warn(f"{obs_id}: DSM not found; skipping.")
+#             continue
+
+#         # Build tasks (collect arrays so we can size progress bars)
+#         tasks = []
+#         for offset in offsets:
+#             for grp, is_sim in ((_group_observed(step_length, offset), False),
+#                                 (_group_simulated(step_length, offset), True)):
+#                 try:
+#                     ds = xr.open_zarr(store, group=grp)
+#                 except Exception:
+#                     ds = None
+#                 if ds is None or "position" not in ds or "observer_height" not in ds:
+#                     continue
+
+#                 # Core arrays
+#                 pos = ds["position"].values  # (point, 2)
+#                 xs = pos[:, 0].astype(float)
+#                 ys = pos[:, 1].astype(float)
+#                 heights = ds["observer_height"].values.astype(float)
+#                 npt = xs.size
+
+#                 # Ragged mapping: point -> track index
+#                 if ("track_start" not in ds) or ("track_count" not in ds):
+#                     warnings.warn(f"{obs_id}/{grp}: missing track_start/track_count; using 'track_unknown'.")
+#                     point_track = np.full(npt, -1, dtype=np.int32)
+#                     track_labels = ["track_unknown"]
+#                 else:
+#                     starts = ds["track_start"].values.astype(np.int64)
+#                     counts = ds["track_count"].values.astype(np.int64)
+#                     n_tracks = starts.size
+
+#                     # Build per-track label list
+#                     track_labels = []
+#                     if "track" in ds.coords and ds["track"].sizes.get("track", n_tracks) == n_tracks:
+#                         # If user already stored track labels, use them — but strip observation prefix if present
+#                         tvals = ds["track"].values
+#                         for ti in range(n_tracks):
+#                             raw = str(tvals[ti])
+#                             # Normalize:
+#                             #   - if already "track000", use as is
+#                             #   - if something like "observation015_track000", strip the observation part
+#                             m = re.search(r"(track\d+)", raw)
+#                             if m:
+#                                 label = m.group(1)   # → track000
+#                             else:
+#                                 label = f"track{ti:03d}"
+#                             track_labels.append(label)
+#                     else:
+#                         # No track coord — fall back to simple track000, track001, ...
+#                         track_labels = [f"track{ti:03d}" for ti in range(n_tracks)]
+
+#                     # Vectorized-ish map: for each track block, assign its track index to its points
+#                     point_track = np.full(npt, -1, dtype=np.int32)
+#                     for ti in range(n_tracks):
+#                         s = int(starts[ti]); c = int(counts[ti])
+#                         if c > 0:
+#                             point_track[s:s+c] = ti
+
+#                 # File IDs: prefer explicit 'id' var if present; else synthesize
+#                 if "id" in ds:
+#                     ids = [str(i) for i in ds["id"].values]
+#                 else:
+#                     # Use frame if available for determinism across discretizations; else fallback to pt index
+#                     if "frame" in ds:
+#                         frames = ds["frame"].values.astype(float)
+#                         ids = []
+#                         for i in range(npt):
+#                             ti = int(point_track[i]) if point_track[i] >= 0 else 0
+#                             label = track_labels[ti] if (0 <= ti < len(track_labels)) else "track_unknown"
+#                             frame_i = int(round(frames[i])) if np.isfinite(frames[i]) else i
+#                             ids.append(f"{obs_id}_{label}_frame{frame_i:06d}")
+#                     else:
+#                         ids = []
+#                         for i in range(npt):
+#                             ti = int(point_track[i]) if point_track[i] >= 0 else 0
+#                             label = track_labels[ti] if (0 <= ti < len(track_labels)) else "track_unknown"
+#                             ids.append(f"{obs_id}_{label}_pt{i:05d}")
+
+#                 tasks.append({
+#                     "grp": grp,
+#                     "is_sim": is_sim,
+#                     "offset": offset,
+#                     "xs": xs, "ys": ys, "heights": heights,
+#                     "ids": ids,
+#                     "point_track": point_track,   # <-- per-point track index
+#                     "track_labels": track_labels, # <-- list of labels per track
+#                 })
+
+#         # observation-level progress
+#         pbar_obs = None
+#         if progress_mode == "observation" and show_progress:
+#             total_pts = int(sum(t["xs"].size for t in tasks))
+#             pbar_obs = tqdm(total=total_pts, desc=f"{obs_id}: viewsheds", unit="pts",
+#                             dynamic_ncols=True, leave=False)
+
+#         # Process tasks
+#         for t in tasks:
+#             grp       = t["grp"]
+#             is_sim    = t["is_sim"]
+#             offset    = t["offset"]
+#             xs        = t["xs"]
+#             ys        = t["ys"]
+#             heights   = t["heights"]
+#             ids       = t["ids"]
+#             p2t       = t["point_track"]
+#             tr_labels = t["track_labels"]
+
+#             # per-group progress
+#             pbar_grp = None
+#             if progress_mode == "group" and show_progress:
+#                 pbar_grp = tqdm(total=int(xs.size), desc=f"{obs_id} | {grp}", unit="pts",
+#                                 dynamic_ncols=True, leave=False)
+
+#             vis = np.full(xs.shape[0], np.nan, dtype=np.float32)
+
+#             for i in range(xs.shape[0]):
+#                 X, Y, hgt, step_id = float(xs[i]), float(ys[i]), float(heights[i]), ids[i]
+
+#                 ti = int(p2t[i]) if (i < p2t.size and p2t[i] >= 0) else -1
+#                 track_label = tr_labels[ti] if (0 <= ti < len(tr_labels)) else "track_unknown"
+
+#                 folder = _viewshed_folder(
+#                     outroot, obs_id,
+#                     track_label=track_label,
+#                     is_simulated=is_sim,
+#                     offset=offset if is_sim else None,
+#                     dataset_tag=(auto_dataset_tag if is_sim else None),
+#                 )
+#                 tif_path = folder / _viewshed_filename(step_id, radius)
+
+#                 # reuse file if allowed and present
+#                 reuse = (reuse_simulated if is_sim else reuse_observed)
+#                 if reuse and tif_path.exists():
+#                     try:
+#                         vis[i] = _viewshed_mean_visible(tif_path)
+#                     except Exception:
+#                         pass  # fall back to compute in-memory
+
+#                 # compute once in memory if needed
+#                 if np.isnan(vis[i]):
+#                     try:
+#                         mem_ds = _viewshed_generate_mem(dsm_path, X, Y, hgt, radius_m=radius)
+#                         try:
+#                             band = mem_ds.GetRasterBand(1)
+#                             stats = band.GetStatistics(0, 1)
+#                             vis[i] = float(stats[2]) if stats is not None else np.nan
+#                             # persist only if flagged for this class
+#                             keep_flag = (keep_simulated if is_sim else keep_observed)
+#                             if keep_flag:
+#                                 _save_mem_to_gtiff(mem_ds, tif_path, threads=threads)
+#                         finally:
+#                             mem_ds = None
+#                     except Exception as exc:
+#                         warnings.warn(f"{obs_id} {grp} point {i}: viewshed error: {exc}")
+#                         vis[i] = np.nan
+
+#                 if pbar_obs is not None:
+#                     pbar_obs.update(1)
+#                 if pbar_grp is not None:
+#                     pbar_grp.update(1)
+
+#             if pbar_grp is not None:
+#                 pbar_grp.close()
+
+#             out = xr.Dataset({"viewshed_vis": (("point",), vis.astype(np.float32))})
+#             out["viewshed_vis"].attrs.update({
+#                 "description": f"Proportion visible in {int(radius)} m viewshed (1 visible, 0 invisible).",
+#                 "radius_m": float(radius),
+#                 "generator": "gdal.ViewshedGenerate (MEM path, optional GTiff persist)",
+#                 "visibleVal": 1, "invisibleVal": 0, "nodataVal": -10000,
+#             })
+#             out.to_zarr(store, group=grp, mode="a")
+
+#         if pbar_obs is not None:
+#             pbar_obs.close()
 
